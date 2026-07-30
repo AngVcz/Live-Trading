@@ -1,0 +1,20 @@
+# Secrets — never commit
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Local Claude tooling/cache
+.claude/
+
+# Run artifacts & machine-specific scheduling
+*.log
+_run_rebalance_*.bat
+
+# Junk
+.env.txt
+Nuevo Documento de texto.txt
