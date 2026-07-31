@@ -16,6 +16,70 @@ class RiskCheckResult:
     messages: List[str]
 
 
+# --- Holiday helpers (NYSE schedule, stdlib only) ---------------------------
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """nth `weekday` (0=Mon..6=Sun) of `month`/`year`."""
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    """Last `weekday` (0=Mon..6=Sun) of `month`/`year`."""
+    if month == 12:
+        last = date(year, 12, 31)
+    else:
+        last = date(year, month + 1, 1) - timedelta(days=1)
+    offset = (last.weekday() - weekday) % 7
+    return last - timedelta(days=offset)
+
+
+def _observed(d: date) -> date:
+    """NYSE observation rule: Saturday -> Friday, Sunday -> Monday."""
+    if d.weekday() == 5:  # Sat
+        return d - timedelta(days=1)
+    if d.weekday() == 6:  # Sun
+        return d + timedelta(days=1)
+    return d
+
+
+def _easter(year: int) -> date:
+    """Anonymous Gregorian computus (matches Python's dateutil.easter)."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    dd = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - dd - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    ell = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * ell) // 451
+    month = (h + ell - 7 * m + 114) // 31
+    day = ((h + ell - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _market_holidays(year: int) -> set:
+    """Set of observed US market holiday dates for `year` (NYSE closures)."""
+    fixed = {
+        _observed(date(year, 1, 1)),    # New Year's Day
+        _observed(date(year, 7, 4)),    # Independence Day
+        _observed(date(year, 12, 25)), # Christmas
+        _observed(date(year, 6, 19)),  # Juneteenth
+    }
+    computed = {
+        _nth_weekday(year, 1, 0, 3),          # MLK Day: 3rd Monday of Jan
+        _last_weekday(year, 5, 0),            # Memorial Day: last Monday of May
+        _nth_weekday(year, 9, 0, 1),           # Labor Day: 1st Monday of Sep
+        _nth_weekday(year, 11, 3, 4),          # Thanksgiving: 4th Thursday of Nov
+        _easter(year) - timedelta(days=2),     # Good Friday
+    }
+    return fixed | computed
+
+
 class RiskGuard:
     """Point-in-time safety checks before executing any trade."""
 
@@ -41,6 +105,7 @@ class RiskGuard:
         target_tickers: Dict[str, float],
         live_equity: Optional[float] = None,
         current_date: Optional[date] = None,
+        sleeve_weights: Optional[object] = None,
     ) -> RiskCheckResult:
         messages: List[str] = []
         today = current_date or date.today()
@@ -57,7 +122,7 @@ class RiskGuard:
             if abs(w) > 1e-6 and t not in prices.columns:
                 messages.append(f"FAIL: target ticker {t} not in price panel")
 
-        # 3. Single position limit.
+        # 3. Single position limit (ticker-level).
         for t, w in target_tickers.items():
             if w > self.max_single_position_pct:
                 messages.append(
@@ -65,7 +130,15 @@ class RiskGuard:
                 )
 
         # 4. Sleeve concentration (A+B combined should not dominate).
-        sleeve_core = target_tickers.get("A", 0.0) + target_tickers.get("B", 0.0)
+        # Use SLEEVE-level weights when available; the old ticker-keyed lookup
+        # (`target_tickers.get("A") + target_tickers.get("B")`) was always 0 because
+        # target_tickers is keyed by ticker (e.g. "SPY"), not by sleeve name.
+        if sleeve_weights is not None:
+            sw = sleeve_weights.to_dict() if hasattr(sleeve_weights, "to_dict") else dict(sleeve_weights)
+            sleeve_core = float(sw.get("A", 0.0) + sw.get("B", 0.0))
+        else:
+            # ponytail: fallback when no sleeve weights passed (always 0 for ticker-keyed dict).
+            sleeve_core = target_tickers.get("A", 0.0) + target_tickers.get("B", 0.0)
         if sleeve_core > self.max_sleeve_pct:
             messages.append(
                 f"FAIL: core sleeve weight {sleeve_core:.2%} exceeds max {self.max_sleeve_pct:.2%}"
@@ -93,13 +166,8 @@ class RiskGuard:
         return RiskCheckResult(ok, messages)
 
     def should_run_today(self, today: Optional[date] = None) -> bool:
-        """Skip weekends and obvious US holidays (simple version)."""
+        """Skip weekends and major US market holidays (NYSE schedule)."""
         d = today or date.today()
         if d.weekday() >= 5:
             return False
-        observed_holidays = {
-            (1, 1),   # New Year's
-            (7, 4),   # Independence Day
-            (12, 25), # Christmas
-        }
-        return (d.month, d.day) not in observed_holidays
+        return d not in _market_holidays(d.year)

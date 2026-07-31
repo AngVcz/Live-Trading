@@ -33,7 +33,7 @@ import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -81,6 +81,10 @@ LOG_DIR = REPO_ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 WEIGHT_LOG = LOG_DIR / "target_weights.jsonl"
 
+# ponytail: default 5% ticker-level drift threshold; trades are skipped when the
+# current book is within this band of the targets (unless it's the annual window).
+DEFAULT_DRIFT_THRESHOLD = 0.05
+
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Daily live runner for A+B+Diversifier Sleeves")
@@ -89,6 +93,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--prefer-yfinance", action="store_true", help="Use yfinance instead of Alpaca")
     p.add_argument("--profile", choices=list(PROFILES), default=None,
                    help="Trade a discretionary profile from logs/discretionary_<date>.json")
+    p.add_argument("--drift-threshold", type=float, default=DEFAULT_DRIFT_THRESHOLD,
+                   help="Ticker-level drift threshold above which a rebalance is forced (default 0.05)")
     return p.parse_args()
 
 
@@ -175,6 +181,89 @@ def _load_profile_tickers(run_date: date, profile: str) -> Dict[str, float]:
     return data["profiles"][profile]["tickers"]
 
 
+# --- Drift gate (ticker-level) ----------------------------------------------
+def is_annual_rebalance_window(run_date: date) -> bool:
+    """Annual scheduled rebalance window (matches build_live_weights: first 5 days of Jan)."""
+    return run_date.month == 1 and run_date.day <= 5
+
+
+def positions_to_weights(positions_value: Dict[str, float], equity: float) -> Dict[str, float]:
+    """Convert market values per ticker to weights using the same equity base."""
+    if equity <= 0:
+        return {t: 0.0 for t in positions_value}
+    return {t: v / equity for t, v in positions_value.items()}
+
+
+def compute_max_drift(
+    target_tickers: Dict[str, float], current_weights: Dict[str, float]
+) -> float:
+    """Max absolute weight deviation between targets and the current book (weight-based)."""
+    tickers = set(target_tickers) | set(current_weights)
+    if not tickers:
+        return 0.0
+    return max(abs(target_tickers.get(t, 0.0) - current_weights.get(t, 0.0)) for t in tickers)
+
+
+def drift_gate_skips(
+    target_tickers: Dict[str, float],
+    current_positions_value: Dict[str, float],
+    equity: float,
+    drift_threshold: float,
+    run_date: date,
+) -> bool:
+    """True when execution should be skipped: drift within threshold AND not in the annual window."""
+    current_weights = positions_to_weights(current_positions_value, equity)
+    max_drift = compute_max_drift(target_tickers, current_weights)
+    return max_drift <= drift_threshold and not is_annual_rebalance_window(run_date)
+
+
+def decide_and_execute(
+    executor: AlpacaExecutor,
+    target_tickers: Dict[str, float],
+    sleeve_weights,
+    prices: pd.DataFrame,
+    run_date: date,
+    account: Dict[str, float],
+    drift_threshold: float,
+    dry_run: bool,
+) -> Tuple[List, bool]:
+    """Apply the ticker-level drift gate; execute via ``executor.rebalance`` unless skipping.
+
+    Always logs target weights (to WEIGHT_LOG) and persists ``last_weights``. When the
+    current book is within ``drift_threshold`` of the targets (and it is not the annual
+    rebalance window) NO orders are placed; the targets are still logged. Returns
+    ``(orders, skipped)``.
+    """
+    equity = account["equity"]
+    current_positions = executor.get_positions()
+    skipped = drift_gate_skips(target_tickers, current_positions, equity, drift_threshold, run_date)
+
+    sw_dict = sleeve_weights.to_dict() if hasattr(sleeve_weights, "to_dict") else dict(sleeve_weights)
+
+    if skipped:
+        current_weights = positions_to_weights(current_positions, equity)
+        max_drift = compute_max_drift(target_tickers, current_weights)
+        print(f"DRIFT: max drift {max_drift:.2%} <= {drift_threshold:.2%}; "
+              f"skipping execution (annual_window={is_annual_rebalance_window(run_date)})")
+        print(f"Ticker targets (logged, not traded): {target_tickers}")
+        orders: List = []
+    else:
+        target_dollars = {t: w * equity for t, w in target_tickers.items()}
+        latest_prices = {t: float(prices[t].iloc[-1]) for t in target_tickers if t in prices.columns}
+        target_portfolio = TargetPortfolio(
+            date=pd.Timestamp(run_date),
+            targets=target_dollars,
+            expected_cash=equity * (1.0 - sum(abs(v) for v in target_tickers.values())),
+            strategy_weights=sw_dict,
+            notes=f"A+B+Diversifier live rebalance ({'paper' if executor.paper else 'LIVE'})",
+        )
+        orders = executor.rebalance(target_portfolio, latest_prices, dry_run=dry_run)
+
+    save_last_weights(target_tickers, run_date)
+    _save_run_log(run_date, target_tickers, orders, account, dry_run)
+    return orders, skipped
+
+
 def main() -> int:
     args = _parse_args()
     run_date = date.fromisoformat(args.date) if args.date else get_last_trading_day()
@@ -182,6 +271,11 @@ def main() -> int:
 
     print(f"[{datetime.now()}] Live runner starting for {run_date} "
           f"(dry_run={args.dry_run}, profile={args.profile})")
+
+    # Fail fast on weekends/holidays BEFORE the expensive data-fetch/signal pipeline.
+    if not RiskGuard().should_run_today(run_date):
+        print("INFO: market closed today; skipping.")
+        return 0
 
     # 1-4. Systematic targets (also gives us prices for the profile path).
     try:
@@ -207,60 +301,72 @@ def main() -> int:
     print(f"Sleeve weights: {sleeve_weights.to_dict()}")
     print(f"Ticker targets: {target_tickers}")
 
-    # 5. Risk checks.
-    peak_equity = get_peak_equity() or 0.0
-    guard = RiskGuard(peak_equity=peak_equity)
-    if not guard.should_run_today(run_date):
-        print("INFO: market closed today; skipping.")
-        return 0
+    # 5. Risk checks -- fetch REAL equity BEFORE guard.check so the drawdown breaker
+    # sees the actual current equity, not the persisted peak.
+    if args.dry_run:
+        # Dry-run: do not touch Alpaca; use a 100k fallback equity so the breaker still
+        # reports what it WOULD do. Never persist the peak from this synthetic equity.
+        executor = AlpacaExecutor(client=None)
+        account = {
+            "equity": 100_000.0,
+            "cash": 100_000.0 * (1.0 - sum(abs(v) for v in target_tickers.values())),
+            "buying_power": 100_000.0,
+            "portfolio_value": 100_000.0,
+        }
+        live_equity = account["equity"]
+    else:
+        try:
+            executor = AlpacaExecutor()
+            account = executor.get_account()
+            live_equity = account["equity"]
+        except Exception as e:
+            print(f"FATAL: could not fetch account equity ({e})")
+            return 1
 
-    risk = guard.check(prices, target_tickers, live_equity=peak_equity, current_date=run_date)
+    # Seed the peak: first-ever run seeds to today's equity rather than 0. In dry-run
+    # we only read the persisted peak for seeding; we never write it.
+    peak_equity = get_peak_equity() or live_equity
+    guard = RiskGuard(peak_equity=peak_equity)
+    risk = guard.check(
+        prices, target_tickers,
+        live_equity=live_equity,
+        current_date=run_date,
+        sleeve_weights=sleeve_weights,
+    )
     if not risk.ok:
         for msg in risk.messages:
             print(f"RISK BLOCK: {msg}")
         return 2
 
-    # 6. Execution.
+    # 6. Drift gate + execution.
     try:
-        if args.dry_run:
-            executor = AlpacaExecutor(client=None)
-            account = {
-                "equity": 100_000.0,
-                "cash": 100_000.0 * (1.0 - sum(abs(v) for v in target_tickers.values())),
-                "buying_power": 100_000.0,
-                "portfolio_value": 100_000.0,
-            }
-        else:
-            executor = AlpacaExecutor()
-            account = executor.get_account()
-        equity = account["equity"]
-
-        # Update peak equity with today's account value.
-        update_peak_equity(equity)
-
-        target_dollars = {t: w * equity for t, w in target_tickers.items()}
-        latest_prices = {t: float(prices[t].iloc[-1]) for t in target_tickers if t in prices.columns}
-
-        target_portfolio = TargetPortfolio(
-            date=pd.Timestamp(run_date),
-            targets=target_dollars,
-            expected_cash=equity * (1.0 - sum(abs(v) for v in target_tickers.values())),
-            strategy_weights=sleeve_weights.to_dict(),
-            notes=f"A+B+Diversifier live rebalance ({'paper' if executor.paper else 'LIVE'})",
+        orders, skipped = decide_and_execute(
+            executor=executor,
+            target_tickers=target_tickers,
+            sleeve_weights=sleeve_weights,
+            prices=prices,
+            run_date=run_date,
+            account=account,
+            drift_threshold=args.drift_threshold,
+            dry_run=args.dry_run,
         )
-        orders = executor.rebalance(target_portfolio, latest_prices, dry_run=args.dry_run)
     except Exception as e:
         print(f"FATAL: execution failed: {e}")
         return 1
 
-    # 7. Persist state and logging.
-    save_last_weights(target_tickers, run_date)
-    _save_run_log(run_date, target_tickers, orders, account, args.dry_run)
+    # 7. Persist peak equity ONLY on a non-dry-run, successful run (never from the
+    # hard-coded 100k dry-run equity). Order matters: state already saved above.
+    if not args.dry_run:
+        update_peak_equity(live_equity)
 
-    print(f"Account equity: ${equity:,.2f}")
-    for o in orders:
-        print(f"  {o.side:4s} {o.ticker:6s} qty={o.qty:,.4f} notional=${o.notional:,.2f} status={o.status}")
-    print(f"[{datetime.now()}] Live runner finished successfully")
+    print(f"Account equity: ${live_equity:,.2f}")
+    if skipped:
+        print(f"[{datetime.now()}] Live runner finished (drift within band; no orders placed)")
+    else:
+        for o in orders:
+            print(f"  {o.side:4s} {o.ticker:6s} qty={o.qty:,.4f} "
+                  f"notional=${o.notional:,.2f} status={o.status}")
+        print(f"[{datetime.now()}] Live runner finished successfully")
     return 0
 
 
