@@ -261,6 +261,14 @@ Smoke tests do not call Alpaca; they use cached yfinance data.
 
 ## 12. Expected metrics (backtest)
 
+> **⚠️ STALE — pending re-run.** The figures below were produced BEFORE the
+> `fix/live-backtest-parity` changes (10 bps sleeve turnover costs, N=2 gate
+> hysteresis, removal of a `.shift` look-ahead in the sleeve backtest, and CTA
+> backtest/live parity). Those fixes remove optimistic bias, so the true
+> Sharpe/Calmar are expected to be **lower** than shown. Do not quote these
+> numbers until the backtest is re-run and this table updated. Tracked as a
+> follow-up (no backtest runner ships in this repo yet).
+
 | Period | CAGR | Vol | Sharpe | Max DD | Calmar |
 |--------|------|-----|--------|--------|--------|
 | 2015-2025 | 16.5% | 7.5% | 2.20 | -7.18% | 2.30 |
