@@ -69,10 +69,11 @@ def test_panel_no_weekend_rows_and_crypto_ffill_limit1(monkeypatch):
     assert "2025-01-11" not in panel.index
     assert "2025-01-12" not in panel.index
 
-    # Crypto ffilled at most one day: Mon 01-13 carries Fri 01-10's close (204);
-    # Tue 01-14 has no recent crypto bar -> NaN (not fabricated).
+    # Crypto ffilled at most one day: Mon 01-13 carries the freshest weekend close
+    # (Sun 01-12 == 206, NOT the stale Fri 01-10 == 204); Tue 01-14 has no recent
+    # crypto bar -> NaN (not fabricated).
     assert panel.loc["2025-01-10", "BTC-USD"] == 204
-    assert panel.loc["2025-01-13", "BTC-USD"] == 204  # ffill limit 1 (Fri -> Mon)
+    assert panel.loc["2025-01-13", "BTC-USD"] == 206  # weekend close carried Fri->Mon
     assert pd.isna(panel.loc["2025-01-14", "BTC-USD"])
 
     # Equity column unaffected.
@@ -90,6 +91,31 @@ def test_panel_raises_when_only_crypto_frames(monkeypatch):
     monkeypatch.setattr(dfd, "fetch_ohlcv", fake_fetch_ohlcv)
     with pytest.raises(RuntimeError, match="No equity"):
         dfd.fetch_panel(["BTC-USD"], date(2025, 1, 6), date(2025, 1, 10))
+
+
+def test_panel_partial_equity_failure_warns_and_nan_column(monkeypatch):
+    """One of two equity fetchers raising: panel still built, failed ticker
+    all-NaN, a warning emitted, no raise."""
+    spy_df = _ohlcv(["2025-01-06", "2025-01-07", "2025-01-08"], [100, 101, 102])
+
+    def fake_fetch_ohlcv(ticker, start, end, prefer_alpaca=True, **kw):
+        if ticker == "SPY":
+            r = spy_df.copy()
+        else:
+            raise RuntimeError(f"boom for {ticker}")
+        r.attrs["source"] = "yfinance"
+        return r
+
+    monkeypatch.setattr(dfd, "fetch_ohlcv", fake_fetch_ohlcv)
+
+    with pytest.warns(UserWarning, match="partial fetch failure"):
+        panel = dfd.fetch_panel(["SPY", "TLT"], date(2025, 1, 6), date(2025, 1, 8),
+                                prefer_alpaca=False)
+
+    assert "SPY" in panel.columns
+    assert "TLT" in panel.columns
+    assert panel["SPY"].notna().all()
+    assert panel["TLT"].isna().all()  # failed ticker -> all-NaN column
 
 
 # ==========================================================================
@@ -175,8 +201,6 @@ def test_mismatched_source_cache_is_not_reused(monkeypatch):
     # Second call: prefer_alpaca=True but Alpaca returns real data this time.
     # The yfinance cache must NOT be served (different source key).
     alpaca_df = _spy_df(start="2024-01-01", end="2024-01-10", base=300.0)
-    monkeypatch.setattr(dfd, "_fetch_alpaca",
-                        lambda t, s, e, **k: alpaca_df.copy())
     alpaca_calls = []
     monkeypatch.setattr(dfd, "_fetch_alpaca",
                         lambda t, s, e, **k: alpaca_calls.append(1) or alpaca_df.copy())
@@ -217,8 +241,32 @@ def test_stale_cache_hit_triggers_tail_refresh(monkeypatch):
     assert cached.index.max() == pd.Timestamp("2025-01-08")
 
 
+def test_stale_cache_hit_served_when_refresh_fails(monkeypatch):
+    """A range-covering cache hit must be served even if the tail-refresh fetch
+    raises — no RuntimeError, no silent source switch."""
+    now = date(2025, 1, 8)  # Wednesday
+    monkeypatch.setattr(dfd, "_today", lambda: now)
+    start, end = date(2025, 1, 6), date(2025, 1, 6)  # Monday requested
+
+    # Range-covering cache (last bar == end == Mon 01-06, 2 days behind now -> stale).
+    seed = _ohlcv(["2025-01-06"], [100.0])
+    dfd._save_cache("SPY", "yfinance", seed)
+
+    # Tail-refresh fetcher raises (network blip). Must NOT switch to Alpaca.
+    def failing_yf(*a, **k):
+        raise RuntimeError("network blip on refresh")
+    monkeypatch.setattr(dfd, "_fetch_yfinance", failing_yf)
+    alpaca_spy = MagicMock(side_effect=AssertionError(
+        "stale-but-covering cache must not switch to fallback source"))
+    monkeypatch.setattr(dfd, "_fetch_alpaca", alpaca_spy)
+
+    out = dfd.fetch_ohlcv("SPY", start, end, prefer_alpaca=False)
+    assert out.attrs["source"] == "yfinance"  # no source switch
+    assert out.loc["2025-01-06", "close"] == 100.0
+    alpaca_spy.assert_not_called()
+
+
 def test_fresh_cache_hit_does_not_refresh(monkeypatch):
-    """A cache hit whose tail is within the staleness window is NOT refreshed."""
     now = date(2025, 1, 8)  # Wednesday
     monkeypatch.setattr(dfd, "_today", lambda: now)
     start, end = date(2025, 1, 6), date(2025, 1, 6)  # Monday requested

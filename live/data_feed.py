@@ -19,6 +19,7 @@ Calendar/provenance notes:
 from __future__ import annotations
 
 import os
+import warnings
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -270,8 +271,10 @@ def fetch_ohlcv(
                         fresh = sfn(ticker, fetch_start, _today())
                         cached = _merge_with_cache(ticker, sname, fresh)
                 except Exception as e:
+                    # ponytail: tail-refresh is best-effort — a covering cache must
+                    # still be served even if the refresh hits a network blip, so we
+                    # log the error and fall through to the return below (no `continue`).
                     errors.append(f"{sname} tail-refresh: {e}")
-                    continue
             result = cached.loc[start:end].copy()
             result.attrs["source"] = sname
             return result
@@ -330,8 +333,17 @@ def fetch_panel(
             "No equity (non-crypto) frames produced; cannot build a calendar. "
             f"Refusing to return a crypto-only panel. Failures: {'; '.join(failures)}"
         )
+    if failures:
+        # Surface a silent partial equity failure so it is not buried in the all-fail path.
+        warnings.warn(
+            f"fetch_panel: partial fetch failure ({len(failures)} ticker(s)): "
+            f"{'; '.join(failures)} — affected columns will be all-NaN.",
+            stacklevel=2,
+        )
 
     # Intersection of equity frames' indexes = the trading calendar.
+    # NOTE: the intersection truncates history to the shortest-lived equity frame,
+    # so a late-listed or delisted ticker shrinks the backtest span.
     cal = None
     for df in equity_frames.values():
         cal = df.index if cal is None else cal.intersection(df.index)
@@ -341,9 +353,15 @@ def fetch_panel(
     for t, df in equity_frames.items():
         aligned[t] = df["close"].reindex(aligned.index)
     for t, df in crypto_frames.items():
-        # Carry a weekend crypto close forward at most one day; do not fabricate.
-        aligned[t] = df["close"].reindex(aligned.index).ffill(limit=1)
+        # ffill on the UNION of the equity calendar and the crypto index, then select
+        # the equity dates: this carries the freshest weekend crypto close (not the
+        # stale Friday close) to Monday, while limit=1 leaves longer gaps as NaN.
+        combined = df["close"].reindex(aligned.index.union(df.index)).ffill(limit=1)
+        aligned[t] = combined.reindex(aligned.index)
 
+    # ponytail: provenance keys are raw tickers (e.g. "^VIX"); consumers that rename
+    # columns (rebalance.py maps "^VIX"->"VIX") must key provenance by the post-rename
+    # name. No consumer reads it yet.
     aligned.attrs["provenance"] = provenance
     return aligned
 
