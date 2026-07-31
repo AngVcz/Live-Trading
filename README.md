@@ -182,6 +182,42 @@ On Windows use Task Scheduler or Git Bash cron.
 
 ---
 
+## 8b. Discretionary 07:30 report (news overlay)
+
+An optional discretionary macro-news overlay that **does not change the
+reproducible/anti-overfit strategy**. The LLM only advises; all weights are
+deterministic.
+
+Flow:
+
+1. **07:30 (scheduled)** — `python scripts/morning_report.py` computes today's
+   systematic targets, asks the LLM (headless `claude` CLI with web search) for a
+   market analysis + a recommended profile, builds three deterministic sizing
+   combinations, and writes:
+   - `logs/morning_report_<date>.pdf` — the LaTeX report (original sizings, market
+     analysis, recommended profile, and three combinations: aggressive / balanced /
+     passive).
+   - `logs/discretionary_<date>.json` — the three profiles' sleeve + ticker weights.
+2. **You read the PDF and pick one profile.**
+3. **You trade it** — `python scripts/rebalance.py --profile <aggressive|balanced|passive>`
+   loads that profile's weights from the JSON and sends balancing orders (paper by
+   default). Risk guardrails still apply.
+
+The three profiles are fixed regime-gate sleeve allocations (each sums to 100%):
+
+| Profile    | A    | B    | rates | bear | cta  | tilt     |
+|------------|------|------|-------|------|------|----------|
+| aggressive | 30%  | 25%  | 10%   | 5%   | 30%  | risk-on  |
+| balanced   | 20%  | 20%  | 20%   | 20%  | 20%  | neutral  |
+| passive    | 10%  | 10%  | 30%   | 25%  | 25%  | risk-off |
+
+The LLM picks one of these; it never edits the numbers. If the LLM call fails, the
+report still ships the three deterministic tables with an "analysis unavailable"
+note. No `anthropic` SDK or extra API key is required — the headless CLI reuses
+your existing Claude Code auth.
+
+Self-check: `python -m live.discretionary`.
+
 ## 9. Risk guardrails
 
 The runner automatically blocks execution if:

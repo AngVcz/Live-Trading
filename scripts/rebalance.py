@@ -10,6 +10,11 @@ at 16:35 ET). It:
   5. Sends orders to Alpaca (paper by default).
   6. Logs weights, orders, and account state.
 
+With ``--profile {aggressive,balanced,passive}`` it instead trades the discretionary
+profile chosen from the 07:30 morning report
+(``logs/discretionary_<date>.json``); weights come from the report, not from the
+systematic engine.
+
 Environment variables:
   ALPACA_API_KEY      required
   ALPACA_API_SECRET   required
@@ -18,6 +23,7 @@ Environment variables:
 Usage:
   cd Live
   python scripts/rebalance.py [--date YYYY-MM-DD] [--dry-run] [--prefer-yfinance]
+  python scripts/rebalance.py --profile balanced [--date YYYY-MM-DD]
 """
 from __future__ import annotations
 
@@ -53,6 +59,7 @@ if not os.environ.get("ALPACA_API_KEY") or not os.environ.get("ALPACA_API_SECRET
 
 from live.core_signals import UNIVERSE as CORE_UNIVERSE, build_core_returns
 from live.data_feed import fetch_panel, get_last_trading_day
+from live.discretionary import PROFILES, apply_profile
 from live.portfolio import (
     SLEEVE_TICKERS,
     SleeveConfig,
@@ -80,7 +87,50 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--date", type=str, default=None, help="Run as-of date (YYYY-MM-DD)")
     p.add_argument("--dry-run", action="store_true", help="Do not place live orders")
     p.add_argument("--prefer-yfinance", action="store_true", help="Use yfinance instead of Alpaca")
+    p.add_argument("--profile", choices=list(PROFILES), default=None,
+                   help="Trade a discretionary profile from logs/discretionary_<date>.json")
     return p.parse_args()
+
+
+def compute_systematic_targets(run_date: date, prefer_alpaca: bool = True) -> Dict:
+    """Run the data-fetch → core-signals → sleeve-weights → decompose pipeline.
+
+    Returns a dict with keys: sleeve_weights (pd.Series), ticker_weights (dict),
+    prices (pd.DataFrame), weights_a_last (pd.Series), weights_b_last (pd.Series).
+    Shared by the systematic path and by morning_report.py.
+    """
+    end_date = run_date
+    start_date = end_date - timedelta(days=365 * 3)
+
+    all_tickers = list(dict.fromkeys(CORE_UNIVERSE + SLEEVE_TICKERS + ["^VIX", "BIL"]))
+    prices = fetch_panel(all_tickers, start_date, end_date, prefer_alpaca=prefer_alpaca)
+
+    if "^VIX" in prices.columns:
+        prices = prices.rename(columns={"^VIX": "VIX"})
+    if "VIX" not in prices.columns:
+        raise RuntimeError("VIX data missing")
+    if "BIL" not in prices.columns:
+        prices["BIL"] = 100.0
+
+    ret_a, ret_b, weights_a, weights_b = build_core_returns(prices, commission_bps=10.0)
+    sleeve_rets = build_sleeve_returns(prices)
+    config = SleeveConfig()
+    last_weights = load_last_weights()
+    sleeve_weights = build_live_weights(
+        ret_a, ret_b, sleeve_rets, config, last_weights, today=pd.Timestamp(run_date)
+    )
+
+    latest_a = weights_a.iloc[-1].fillna(0.0)
+    latest_b = weights_b.iloc[-1].fillna(0.0)
+    ticker_weights = decompose_target_to_tickers(sleeve_weights, latest_a, latest_b, prices)
+
+    return {
+        "sleeve_weights": sleeve_weights,
+        "ticker_weights": ticker_weights,
+        "prices": prices,
+        "weights_a_last": latest_a,
+        "weights_b_last": latest_b,
+    }
 
 
 def _save_run_log(
@@ -112,51 +162,47 @@ def _save_run_log(
         f.write(json.dumps(record) + "\n")
 
 
+def _load_profile_tickers(run_date: date, profile: str) -> Dict[str, float]:
+    """Read the chosen profile's ticker weights from the morning report JSON."""
+    path = LOG_DIR / f"discretionary_{run_date.isoformat()}.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"discretionary report not found: {path}. Run scripts/morning_report.py "
+            f"--date {run_date.isoformat()} first."
+        )
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    return data["profiles"][profile]["tickers"]
+
+
 def main() -> int:
     args = _parse_args()
     run_date = date.fromisoformat(args.date) if args.date else get_last_trading_day()
-    end_date = run_date
-    start_date = end_date - timedelta(days=365 * 3)
-
-    print(f"[{datetime.now()}] Live runner starting for {run_date} (dry_run={args.dry_run})")
-
-    # 1. Data fetch.
-    all_tickers = list(dict.fromkeys(CORE_UNIVERSE + SLEEVE_TICKERS + ["^VIX", "BIL"]))
     prefer_alpaca = not args.prefer_yfinance
+
+    print(f"[{datetime.now()}] Live runner starting for {run_date} "
+          f"(dry_run={args.dry_run}, profile={args.profile})")
+
+    # 1-4. Systematic targets (also gives us prices for the profile path).
     try:
-        prices = fetch_panel(all_tickers, start_date, end_date, prefer_alpaca=prefer_alpaca)
+        sys_targets = compute_systematic_targets(run_date, prefer_alpaca=prefer_alpaca)
     except Exception as e:
-        print(f"FATAL: could not fetch price panel: {e}")
+        print(f"FATAL: systematic pipeline failed: {e}")
         return 1
+    prices = sys_targets["prices"]
 
-    # Rename ^VIX to VIX for consistency.
-    if "^VIX" in prices.columns:
-        prices = prices.rename(columns={"^VIX": "VIX"})
-    if "VIX" not in prices.columns:
-        print("FATAL: VIX data missing")
-        return 1
-
-    # Ensure cash proxy exists.
-    if "BIL" not in prices.columns:
-        prices["BIL"] = 100.0
-
-    # 2. Core signals A and B.
-    try:
-        ret_a, ret_b, weights_a, weights_b = build_core_returns(prices, commission_bps=10.0)
-    except Exception as e:
-        print(f"FATAL: core signal engine failed: {e}")
-        return 1
-
-    # 3. Sleeve returns and target weights.
-    sleeve_rets = build_sleeve_returns(prices)
-    config = SleeveConfig()
-    last_weights = load_last_weights()
-    sleeve_weights = build_live_weights(ret_a, ret_b, sleeve_rets, config, last_weights, today=pd.Timestamp(run_date))
-
-    # 4. Decompose to tickers.
-    latest_a = weights_a.iloc[-1].fillna(0.0)
-    latest_b = weights_b.iloc[-1].fillna(0.0)
-    target_tickers = decompose_target_to_tickers(sleeve_weights, latest_a, latest_b, prices)
+    if args.profile:
+        try:
+            target_tickers = _load_profile_tickers(run_date, args.profile)
+        except Exception as e:
+            print(f"FATAL: could not load profile '{args.profile}': {e}")
+            return 1
+        sleeve_weights = apply_profile(args.profile)
+        print(f"Using discretionary profile '{args.profile}' "
+              f"({len(target_tickers)} tickers).")
+    else:
+        target_tickers = sys_targets["ticker_weights"]
+        sleeve_weights = sys_targets["sleeve_weights"]
 
     print(f"Sleeve weights: {sleeve_weights.to_dict()}")
     print(f"Ticker targets: {target_tickers}")

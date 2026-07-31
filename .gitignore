@@ -21,6 +21,7 @@ cache/
 # Run artifacts & machine-specific scheduling
 *.log
 _run_rebalance_*.bat
+_run_morning_report*.bat
 
 # Junk
 .env.txt
