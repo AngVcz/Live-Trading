@@ -25,11 +25,8 @@ def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
 
 
 def _last_weekday(year: int, month: int, weekday: int) -> date:
-    """Last `weekday` (0=Mon..6=Sun) of `month`/`year`."""
-    if month == 12:
-        last = date(year, 12, 31)
-    else:
-        last = date(year, month + 1, 1) - timedelta(days=1)
+    """Last `weekday` (0=Mon..6=Sun) of `month`/`year` (month in 1..11)."""
+    last = date(year, month + 1, 1) - timedelta(days=1)
     offset = (last.weekday() - weekday) % 7
     return last - timedelta(days=offset)
 

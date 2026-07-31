@@ -202,6 +202,52 @@ def test_drift_gate_forces_execute_in_annual_window(patch_paths):
     assert len(executor.calls) == 1
 
 
+def test_drift_gate_boundary_at_exact_threshold_skips(patch_paths):
+    """max_drift == drift_threshold (default 0.05) -> skipped (<= is inclusive).
+
+    Engineered so the max drift is exactly the float 0.05: BIL current weight is
+    5000/100000 == 0.05 (the same float as the literal 0.05) and the BIL target is
+    0.0, so |0.0 - 0.05| == 0.05 exactly; SPY is held at target (drift 0.0).
+    """
+    executor = FakeExecutor(equity=100_000.0, positions={"SPY": 95_000.0, "BIL": 5_000.0})
+    targets = {"SPY": 0.95, "BIL": 0.0}
+    prices = _syn_prices(list(targets))
+    sleeve = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "bear": 0.2, "cta": 0.2})
+
+    orders, skipped = rb.decide_and_execute(
+        executor, targets, sleeve, prices, date(2025, 3, 3),
+        account=executor.get_account(), drift_threshold=0.05, dry_run=True,
+    )
+    assert skipped is True
+    assert orders == []
+    assert executor.calls == []
+
+
+def test_drift_gate_fires_on_current_only_ticker(patch_paths):
+    """An extra CURRENT ticker absent from targets counts as drift (union of tickers)."""
+    # SPY 20k (20%) is current-only; targets have no SPY -> drift 0.20 > 0.05.
+    executor = FakeExecutor(equity=100_000.0, positions={"SPY": 20_000.0})
+    targets = {"BIL": 1.0}
+    prices = _syn_prices(["BIL", "SPY"])
+    sleeve = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "bear": 0.2, "cta": 0.2})
+
+    orders, skipped = rb.decide_and_execute(
+        executor, targets, sleeve, prices, date(2025, 3, 3),
+        account=executor.get_account(), drift_threshold=0.05, dry_run=True,
+    )
+    assert skipped is False
+    assert len(executor.calls) == 1
+
+
+# --- (c2) AlpacaExecutor None-client guard (dry-run path) ------------------
+def test_executor_get_positions_none_client_returns_empty():
+    from live.alpaca_executor import AlpacaExecutor
+    # Dry-run construction (client=None) must not crash when the drift gate
+    # calls get_positions(); returns an empty book so drift forces a (dry) trade.
+    executor = AlpacaExecutor(client=None)
+    assert executor.get_positions() == {}
+
+
 # --- (d) should_run_today holidays ----------------------------------------
 @pytest.mark.parametrize("d,expected", [
     (date(2025, 11, 27), False),  # Thanksgiving 2025 (4th Thursday)

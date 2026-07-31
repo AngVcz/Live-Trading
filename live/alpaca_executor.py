@@ -96,6 +96,8 @@ class AlpacaExecutor:
 
     def get_positions(self) -> Dict[str, float]:
         """Return current market value per ticker."""
+        if self.client is None:
+            return {}
         positions = self.client.get_all_positions()
         return {p.symbol: float(p.market_value) for p in positions}
 

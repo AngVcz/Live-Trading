@@ -259,6 +259,9 @@ def decide_and_execute(
         )
         orders = executor.rebalance(target_portfolio, latest_prices, dry_run=dry_run)
 
+    # ponytail: save_last_weights stores ticker-level weights; build_live_weights
+    # is sleeve-indexed so the index mismatch makes it a no-op there. The skip-path
+    # save is intentional for execution logging only (not for sleeve drift).
     save_last_weights(target_tickers, run_date)
     _save_run_log(run_date, target_tickers, orders, account, dry_run)
     return orders, skipped
