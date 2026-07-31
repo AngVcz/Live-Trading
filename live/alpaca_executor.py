@@ -5,7 +5,9 @@ The executor sells first, then buys, to free buying power and minimize margin ri
 """
 from __future__ import annotations
 
+import json
 import os
+import warnings
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -16,17 +18,78 @@ import pandas as pd
 # Optional Alpaca SDK.
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
     from alpaca.trading.enums import OrderSide, TimeInForce
 except Exception:  # pragma: no cover
     TradingClient = None  # type: ignore
     OrderSide = None  # type: ignore
     TimeInForce = None  # type: ignore
+    LimitOrderRequest = None  # type: ignore
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent  # live/ -> repo root
 LOG_DIR = REPO_ROOT / "logs" / "orders"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Wash-sale awareness (WARN only, no tax-lot logic). Tracked inverse/vol ETFs:
+# every SELL of one of these is conservatively recorded as a realized-loss date;
+# a BUY of the same symbol within 30 calendar days emits a warning (never blocks).
+WASH_SALE_SYMBOLS = frozenset({"SH", "PSQ", "VIXY"})
+WASH_SALE_WINDOW_DAYS = 30
+WASH_SALE_PATH = REPO_ROOT / "logs" / "wash_sale.json"
+
+
+def load_wash_sale() -> Dict[str, List[str]]:
+    if not WASH_SALE_PATH.exists():
+        return {}
+    try:
+        return json.loads(WASH_SALE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_wash_sale(state: Dict[str, List[str]]) -> None:
+    WASH_SALE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WASH_SALE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def record_realized_loss(symbol: str, fill_date: Any) -> None:
+    """Record a realized-loss date for a wash-sale-tracked symbol.
+
+    Conservative and mechanical: treats every SELL of SH/PSQ/VIXY as a loss
+    event (no tax-lot/basis logic). Dates older than the 30-day window relative
+    to ``fill_date`` are pruned to keep the JSON bounded.
+    """
+    sym = symbol.upper()
+    if sym not in WASH_SALE_SYMBOLS:
+        return
+    as_of = pd.Timestamp(fill_date).date()
+    cutoff = as_of - pd.Timedelta(days=WASH_SALE_WINDOW_DAYS)
+    state = load_wash_sale()
+    dates = [d for d in state.get(sym, []) if pd.Timestamp(d).date() >= cutoff]
+    iso = as_of.isoformat()
+    if iso not in dates:
+        dates.append(iso)
+    state[sym] = dates
+    save_wash_sale(state)
+
+
+def _wash_sale_loss_within(symbol: str, as_of: Any) -> Optional[str]:
+    """ISO date of the most recent recorded realized loss within 30 cal days, else None."""
+    sym = symbol.upper()
+    if sym not in WASH_SALE_SYMBOLS:
+        return None
+    state = load_wash_sale()
+    dates = state.get(sym, [])
+    if not dates:
+        return None
+    as_of_d = pd.Timestamp(as_of).date()
+    for iso in sorted(dates, reverse=True):
+        d = pd.Timestamp(iso).date()
+        delta_days = (as_of_d - d).days
+        if 0 <= delta_days <= WASH_SALE_WINDOW_DAYS:
+            return iso
+    return None
 
 
 def _get_trading_client() -> Optional[TradingClient]:
@@ -72,8 +135,14 @@ class AlpacaExecutor:
         self,
         client: Optional[TradingClient] = _NoClientSentinel,
         fractional: bool = True,
+        illiquid_symbols: Optional[Any] = None,
+        illiquid_buffer: float = 0.005,
     ):
         self.fractional = fractional
+        # Optional limit-price set for illiquid names that gap on market open
+        # (e.g. KMLM, VIXY, PSQ). Default empty -> plain market orders for all.
+        self.illiquid_symbols = set(illiquid_symbols) if illiquid_symbols else set()
+        self.illiquid_buffer = float(illiquid_buffer)
         self.paper = True
         if client is _NoClientSentinel:
             if TradingClient is None:
@@ -160,21 +229,33 @@ class AlpacaExecutor:
             target_dollar = target_clean.get(t, 0.0)
             current_dollar = current.get(t, 0.0)
             delta = target_dollar - current_dollar
+            # Delta deadband: $0.01 per-share rounding/noise threshold — skip
+            # ~zero deltas (the rounding noise floor, NOT a skip-size gate).
             if abs(delta) < 0.01:
                 continue
+            notional = abs(delta)
+            # Min-notional skip: $1 — too small to bother sending. This is a
+            # coarser skip-decision gate ON TOP of the $0.01 delta deadband:
+            # an order can clear the $0.01 deadband but still be sub-$1 noise.
+            if notional < 1.0:
+                continue
             side = "BUY" if delta > 0 else "SELL"
-            qty = self._qty_for_notional(abs(delta), price)
+            qty = self._qty_for_notional(notional, price)
             if qty <= 0:
                 continue
             orders.append({
                 "ticker": t,
                 "side": side,
                 "qty": qty,
-                "notional": abs(delta),
+                "notional": notional,
                 "price": price,
             })
 
         # Sell first, then buy.
+        # TODO(buying-power): do NOT re-fetch buying power between sell and buy
+        # batches here. Sells land asynchronously and may not have settled; a
+        # half-correct re-fetch would race the fill stream and could over/under-
+        # state available buying power. Leave the single pre-rebalance fetch.
         sell_orders = [o for o in orders if o["side"] == "SELL"]
         buy_orders = [o for o in orders if o["side"] == "BUY"]
         ordered = sell_orders + buy_orders
@@ -186,19 +267,24 @@ class AlpacaExecutor:
                     o["ticker"], side_label, o["qty"], o["notional"], "dry_run"
                 ))
                 continue
+            # Wash-sale awareness (WARN only, never blocks): a BUY of an inverse
+            # /vol ETF within 30 days of a recorded realized loss on the same
+            # symbol. Emitted before submit so the order still goes through.
+            if side_label == "BUY":
+                loss_date = _wash_sale_loss_within(o["ticker"], target.date)
+                if loss_date is not None:
+                    wmsg = (f"wash-sale: BUY {o['ticker']} within 30d of "
+                            f"realized loss on {loss_date}")
+                    warnings.warn(wmsg)
+                    print(f"[WARN] {wmsg}")
             try:
                 alpaca_side = OrderSide.BUY if o["side"] == "BUY" else OrderSide.SELL
-                # ponytail: fractional orders must be DAY on Alpaca (42210000);
-                # whole-share keeps GTC. Daily rebalance wants DAY anyway.
                 qty = Decimal(str(o["qty"])).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
-                tif = TimeInForce.DAY if (self.fractional and qty % 1 != 0) else TimeInForce.GTC
-                req = MarketOrderRequest(
-                    symbol=o["ticker"],
-                    qty=qty,
-                    side=alpaca_side,
-                    time_in_force=tif,
-                )
-                submitted = self.client.submit_order(req)
+                # Daily rebalance: no order should sit open across days, so
+                # whole-share AND fractional market orders use DAY. (Fractional
+                # already required DAY on Alpaca; whole-share now matches.)
+                tif = TimeInForce.DAY
+                submitted = self._submit_order(o, alpaca_side, qty, tif)
                 results.append(OrderResult(
                     o["ticker"],
                     side_label,
@@ -206,6 +292,11 @@ class AlpacaExecutor:
                     o["notional"],
                     str(submitted.status),
                 ))
+                # Record realized-loss date on SELL of wash-sale-tracked symbols.
+                # Conservative: treat every SELL of SH/PSQ/VIXY as a loss event
+                # (no tax-lot/basis logic; warning only, never blocks).
+                if side_label == "SELL" and o["ticker"] in WASH_SALE_SYMBOLS:
+                    record_realized_loss(o["ticker"], target.date)
             except Exception as e:
                 results.append(OrderResult(
                     o["ticker"], side_label, o["qty"], o["notional"], "error", str(e)
@@ -213,6 +304,42 @@ class AlpacaExecutor:
 
         self._log_rebalance(target, account, positions, results)
         return results
+
+    def _submit_order(self, o, alpaca_side, qty, tif):
+        """Submit one order, using a limit price for the illiquid set.
+
+        For symbols in ``self.illiquid_symbols`` a limit order at
+        ``close*(1 ∓ buffer)`` is attempted first (sell above close, buy below).
+        If the SDK rejects fractional+limit+DAY (or anything else about the
+        limit request), fall back to a plain market order for that symbol.
+        """
+        sym = o["ticker"]
+        price = o["price"]
+        if sym in self.illiquid_symbols and LimitOrderRequest is not None:
+            try:
+                if o["side"] == "BUY":
+                    lp = price * (1.0 - self.illiquid_buffer)
+                else:
+                    lp = price * (1.0 + self.illiquid_buffer)
+                req = LimitOrderRequest(
+                    symbol=sym,
+                    qty=qty,
+                    side=alpaca_side,
+                    time_in_force=tif,
+                    limit_price=lp,
+                )
+                return self.client.submit_order(req)
+            except Exception:
+                # ponytail: fractional+limit+DAY is rejected by Alpaca for
+                # some combos; fall back to a plain market order.
+                req = MarketOrderRequest(
+                    symbol=sym, qty=qty, side=alpaca_side, time_in_force=tif,
+                )
+                return self.client.submit_order(req)
+        req = MarketOrderRequest(
+            symbol=sym, qty=qty, side=alpaca_side, time_in_force=tif,
+        )
+        return self.client.submit_order(req)
 
     def _log_rebalance(
         self,
@@ -237,4 +364,6 @@ class AlpacaExecutor:
                 "paper": self.paper,
             })
         df = pd.DataFrame(rows)
-        df.to_csv(path, index=False)
+        # APPEND on same-day re-runs (preserve earlier runs, don't overwrite).
+        write_header = not path.exists()
+        df.to_csv(path, index=False, mode="a", header=write_header)
