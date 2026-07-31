@@ -12,8 +12,11 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-LOG_PATH = PROJECT_ROOT / ".claude" / "cache" / "live" / "target_weights.jsonl"
+# Repo root (parent of live/) — must match scripts/rebalance.py LOG_DIR, which writes
+# ``logs/target_weights.jsonl``. The old path pointed one level too high
+# (Trading I/.claude/cache/live/...) so the monitor always saw "no live records yet".
+REPO_ROOT = Path(__file__).resolve().parent.parent
+LOG_PATH = REPO_ROOT / "logs" / "target_weights.jsonl"
 
 
 def load_run_log(path: Optional[Path] = None) -> pd.DataFrame:
