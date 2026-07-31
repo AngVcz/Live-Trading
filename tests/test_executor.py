@@ -339,6 +339,73 @@ def test_wash_sale_helper_symbol_not_tracked_returns_none(wash_sale_path):
     assert not wash_sale_path.exists()
 
 
+# --- (e-extra) wash-sale boundary + corrupt-state load ---------------------
+def test_wash_sale_warns_at_exactly_day_30(wash_sale_path):
+    """Boundary: delta_days == 30 is within the window (code uses <= 30)."""
+    record_realized_loss("SH", date(2025, 1, 10))
+    client = FakeClient()
+    executor = AlpacaExecutor(client=client, fractional=True)
+    # 2025-01-10 + 30 days == 2025-02-09 -> exactly at the boundary, warns.
+    with pytest.warns(UserWarning, match="wash-sale: BUY SH within 30d"):
+        executor.rebalance(
+            _target({"SH": 1000.0}, cash=99_000.0, as_of="2025-02-09"),
+            {"SH": 100.0},
+            dry_run=False,
+        )
+    assert len(client.submitted) == 1
+
+
+def test_load_wash_sale_swallows_corrupt_json(tmp_path, monkeypatch):
+    p = tmp_path / "wash_sale.json"
+    p.write_text("not valid json {{{", encoding="utf-8")
+    monkeypatch.setattr(exe_mod, "WASH_SALE_PATH", p)
+    assert exe_mod.load_wash_sale() == {}  # no raise
+    # Subsequent record still works (file is overwritten with valid JSON).
+    record_realized_loss("SH", date(2025, 1, 10))
+    state = json.loads(p.read_text(encoding="utf-8"))
+    assert state == {"SH": ["2025-01-10"]}
+
+
+# --- (d-extra) limit never-fill + sell-side buffer direction ---------------
+def test_illiquid_limit_not_filled_warns_no_market_fallback():
+    """A DAY limit accepted but unfilled (status='new') warns and does NOT
+    trigger the market fallback (fallback only fires on submit exception)."""
+    client = FakeClient(submit_side_effect=lambda req: FakeSubmitted(status="new"))
+    executor = AlpacaExecutor(
+        client=client, fractional=True,
+        illiquid_symbols={"KMLM"}, illiquid_buffer=0.005,
+    )
+    with pytest.warns(UserWarning, match="KMLM order not filled"):
+        executor.rebalance(
+            _target({"KMLM": 1000.0}, cash=99_000.0),
+            {"KMLM": 100.0},
+            dry_run=False,
+        )
+    # Only the limit order was submitted; no market fallback (no exception).
+    assert len(client.submitted) == 1
+    assert isinstance(client.submitted[0], LimitOrderRequest)
+
+
+def test_illiquid_sell_limit_price_is_above_close():
+    """SELL limit = close*(1+buffer) — above close, not below."""
+    client = FakeClient(positions=[FakePosition("KMLM", 5_000.0)])
+    executor = AlpacaExecutor(
+        client=client, fractional=True,
+        illiquid_symbols={"KMLM"}, illiquid_buffer=0.005,
+    )
+    executor.rebalance(
+        _target({"KMLM": 0.0}, cash=105_000.0),  # SELL out of 5000 @ 100
+        {"KMLM": 100.0},
+        dry_run=False,
+    )
+    assert len(client.submitted) == 1
+    req = client.submitted[0]
+    assert isinstance(req, LimitOrderRequest)
+    assert req.side == OrderSide.SELL
+    # SELL limit = 100 * (1 + 0.005) = 100.5 (above close).
+    assert req.limit_price == pytest.approx(100.5, abs=1e-6)
+
+
 # --- (f) buying-power re-fetch is NOT implemented (TODO honored) ----------
 def test_no_second_buying_power_fetch_between_sell_and_buy():
     """Two SELLs then two BUYs: get_account must be called exactly once

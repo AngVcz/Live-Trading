@@ -57,8 +57,10 @@ def record_realized_loss(symbol: str, fill_date: Any) -> None:
     """Record a realized-loss date for a wash-sale-tracked symbol.
 
     Conservative and mechanical: treats every SELL of SH/PSQ/VIXY as a loss
-    event (no tax-lot/basis logic). Dates older than the 30-day window relative
-    to ``fill_date`` are pruned to keep the JSON bounded.
+    event (no tax-lot/basis logic). This intentionally OVER-WARNS on re-entries
+    after a profitable sell, but is WARN-only and carries no tax semantics.
+    Dates older than the 30-day window relative to ``fill_date`` are pruned
+    to keep the JSON bounded.
     """
     sym = symbol.upper()
     if sym not in WASH_SALE_SYMBOLS:
@@ -277,6 +279,7 @@ class AlpacaExecutor:
                             f"realized loss on {loss_date}")
                     warnings.warn(wmsg)
                     print(f"[WARN] {wmsg}")
+            submit_ok = False
             try:
                 alpaca_side = OrderSide.BUY if o["side"] == "BUY" else OrderSide.SELL
                 qty = Decimal(str(o["qty"])).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
@@ -285,22 +288,36 @@ class AlpacaExecutor:
                 # already required DAY on Alpaca; whole-share now matches.)
                 tif = TimeInForce.DAY
                 submitted = self._submit_order(o, alpaca_side, qty, tif)
+                status_str = str(submitted.status)
                 results.append(OrderResult(
                     o["ticker"],
                     side_label,
                     o["qty"],
                     o["notional"],
-                    str(submitted.status),
+                    status_str,
                 ))
-                # Record realized-loss date on SELL of wash-sale-tracked symbols.
-                # Conservative: treat every SELL of SH/PSQ/VIXY as a loss event
-                # (no tax-lot/basis logic; warning only, never blocks).
-                if side_label == "SELL" and o["ticker"] in WASH_SALE_SYMBOLS:
-                    record_realized_loss(o["ticker"], target.date)
+                submit_ok = True
+                # Non-fill observation (WARN, not raise): a DAY limit may be
+                # accepted but sit unfilled and expire at EOD; a market order
+                # that doesn't immediately fill is surfaced too. The safety net
+                # is next-day drift recomputing and resubmitting the delta.
+                if status_str != "filled":
+                    nf = (f"{o['ticker']} order not filled (status={status_str}); "
+                          f"will be re-corrected by next-day drift")
+                    warnings.warn(nf)
+                    print(f"[WARN] {nf}")
             except Exception as e:
                 results.append(OrderResult(
                     o["ticker"], side_label, o["qty"], o["notional"], "error", str(e)
                 ))
+            # Record realized-loss date on SELL of wash-sale-tracked symbols.
+            # Isolated so a wash_sale.json write failure never double-logs or
+            # crashes the order path; only on a successful submit.
+            if submit_ok and side_label == "SELL" and o["ticker"] in WASH_SALE_SYMBOLS:
+                try:
+                    record_realized_loss(o["ticker"], target.date)
+                except Exception as we:
+                    warnings.warn(f"wash-sale record failed for {o['ticker']}: {we}")
 
         self._log_rebalance(target, account, positions, results)
         return results
@@ -328,6 +345,10 @@ class AlpacaExecutor:
                     time_in_force=tif,
                     limit_price=lp,
                 )
+                # TODO(limit-never-fill): a DAY limit may expire unfilled at EOD;
+                # no in-day cancel/fallback-to-market is performed here. Next-day
+                # drift recomputes the delta and resubmits, which is the safety
+                # net. The caller also warns on any non-"filled" submit status.
                 return self.client.submit_order(req)
             except Exception:
                 # ponytail: fractional+limit+DAY is rejected by Alpaca for
@@ -366,4 +387,10 @@ class AlpacaExecutor:
         df = pd.DataFrame(rows)
         # APPEND on same-day re-runs (preserve earlier runs, don't overwrite).
         write_header = not path.exists()
-        df.to_csv(path, index=False, mode="a", header=write_header)
+        try:
+            df.to_csv(path, index=False, mode="a", header=write_header)
+        except Exception as le:
+            # ponytail: logging must never crash the live runner after orders
+            # were already submitted (e.g. a Windows file lock by another proc).
+            warnings.warn(f"rebalance log write failed for {path}: {le}")
+            print(f"[WARN] rebalance log write failed for {path}: {le}")
