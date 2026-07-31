@@ -24,8 +24,8 @@ except Exception:  # pragma: no cover
     TimeInForce = None  # type: ignore
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-LOG_DIR = PROJECT_ROOT / ".claude" / "cache" / "live" / "orders"
+REPO_ROOT = Path(__file__).resolve().parent.parent  # live/ -> repo root
+LOG_DIR = REPO_ROOT / "logs" / "orders"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 

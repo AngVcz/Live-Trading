@@ -1,8 +1,8 @@
 """Live market-data feed for the A+B+Diversifier Sleeves strategy.
 
 Supports Alpaca Market Data API as the primary source with yfinance as fallback.
-All data is cached on disk under ``.claude/cache/live/`` so backfills and restarts
-are fast and deterministic.
+All data is cached on disk under ``cache/`` (repo-local, gitignored) so backfills
+and restarts are fast and deterministic.
 """
 from __future__ import annotations
 
@@ -28,8 +28,8 @@ except Exception:  # pragma: no cover
     yf = None  # type: ignore
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-CACHE_DIR = PROJECT_ROOT / ".claude" / "cache" / "live"
+REPO_ROOT = Path(__file__).resolve().parent.parent  # live/ -> repo root
+CACHE_DIR = REPO_ROOT / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 

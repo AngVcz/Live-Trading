@@ -1,0 +1,21 @@
+[project]
+name = "live"
+version = "0.1.0"
+description = "A+B+Diversifier Sleeves — live trading on Alpaca"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "alpaca-py",
+    "python-dotenv",
+    "numpy",
+    "pandas",
+    "scipy",
+    "yfinance",
+]
+
+[project.optional-dependencies]
+notebook = ["matplotlib", "seaborn"]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

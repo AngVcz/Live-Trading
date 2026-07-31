@@ -11,6 +11,13 @@ __pycache__/
 # Local Claude tooling/cache
 .claude/
 
+# Runtime artifacts (repo-local); keep the dir via .gitkeep
+logs/*
+!logs/.gitkeep
+
+# Data-feed cache (regenerable)
+cache/
+
 # Run artifacts & machine-specific scheduling
 *.log
 _run_rebalance_*.bat

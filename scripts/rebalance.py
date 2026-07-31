@@ -17,7 +17,7 @@ Environment variables:
 
 Usage:
   cd Live
-  python live_runner.py [--date YYYY-MM-DD] [--dry-run] [--prefer-yfinance]
+  python scripts/rebalance.py [--date YYYY-MM-DD] [--dry-run] [--prefer-yfinance]
 """
 from __future__ import annotations
 
@@ -31,16 +31,15 @@ from typing import Dict, Optional
 
 import pandas as pd
 
-# Ensure project root (parent of Live/) is on path for sibling imports.
-LIVE_ROOT = Path(__file__).resolve().parent
-PROJECT_ROOT = LIVE_ROOT.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# Repo root (parent of scripts/) on path so `live.*` imports resolve.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-# Load .env explicitly from the Live/ folder.
+# Load .env from the repo root.
 try:
     from dotenv import load_dotenv
-    env_path = LIVE_ROOT / ".env"
+    env_path = REPO_ROOT / ".env"
     if env_path.exists():
         load_dotenv(dotenv_path=str(env_path), override=True)
     else:
@@ -71,7 +70,7 @@ from live.state import (
 )
 
 
-LOG_DIR = PROJECT_ROOT / ".claude" / "cache" / "live"
+LOG_DIR = REPO_ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 WEIGHT_LOG = LOG_DIR / "target_weights.jsonl"
 

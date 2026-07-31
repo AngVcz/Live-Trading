@@ -7,12 +7,9 @@ outputs end-to-end.
 from __future__ import annotations
 
 from datetime import date, timedelta
-from pathlib import Path
 
 import pandas as pd
 import pytest
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def _load_prices() -> pd.DataFrame:

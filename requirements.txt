@@ -1,0 +1,10 @@
+# Runtime + notebook + test deps. `pip install -r requirements.txt`.
+alpaca-py
+python-dotenv
+numpy
+pandas
+scipy
+yfinance
+matplotlib
+seaborn
+pytest

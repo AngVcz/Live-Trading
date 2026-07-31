@@ -9,8 +9,8 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-STATE_PATH = PROJECT_ROOT / ".claude" / "cache" / "live" / "state.json"
+REPO_ROOT = Path(__file__).resolve().parent.parent  # live/ -> repo root
+STATE_PATH = REPO_ROOT / "logs" / "state.json"
 
 
 def load_state() -> Dict[str, Any]:

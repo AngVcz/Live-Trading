@@ -92,9 +92,11 @@ The strategy is a **fixed-weight** ensemble at the sleeve level, not dynamic. Re
 
 ```
 Live/
-├── live_runner.py              # Daily scheduler
-├── README.md                   # This file
-├── live/
+├── README.md
+├── pyproject.toml             # Project metadata + deps + pytest config
+├── requirements.txt            # `pip install -r requirements.txt`
+├── .env.example                # Template; copy to .env (gitignored)
+├── live/                       # Strategy package
 │   ├── __init__.py
 │   ├── core_signals.py         # Point-in-time engines A and B
 │   ├── data_feed.py            # Alpaca + yfinance + cache
@@ -103,9 +105,15 @@ Live/
 │   ├── risk.py                 # Safety guardrails
 │   ├── state.py                # Peak equity / weights persistence
 │   └── monitor.py              # Live vs backtest monitoring
-└── tests/
-    ├── __init__.py
-    └── test_live_pipeline.py   # Smoke tests
+├── scripts/
+│   └── rebalance.py            # Daily entry point (was live_runner.py)
+├── notebooks/
+│   └── A_B_Diversifier_Analytics.ipynb
+├── tests/
+│   ├── __init__.py
+│   └── test_live_pipeline.py   # Smoke tests
+└── logs/                       # Runtime artifacts (gitignored): state.json, orders_*.csv, target_weights.jsonl
+    └── .gitkeep
 ```
 
 ---
@@ -116,7 +124,7 @@ Live/
 
 ```bash
 cd Live
-pip install -r ../requirements.txt
+pip install -r requirements.txt
 ```
 
 ### Credentials
@@ -139,7 +147,7 @@ ALPACA_LIVE=false
 
 ```bash
 cd Live
-python live_runner.py --date 2025-06-27 --dry-run --prefer-yfinance
+python scripts/rebalance.py --date 2025-06-27 --dry-run --prefer-yfinance
 ```
 
 This uses yfinance, simulates a $100,000 account, and prints the orders it would send.
@@ -151,7 +159,7 @@ This uses yfinance, simulates a $100,000 account, and prints the orders it would
 
 ```bash
 cd Live
-python live_runner.py --prefer-yfinance
+python scripts/rebalance.py --prefer-yfinance
 ```
 
 ### Real live trading
@@ -167,7 +175,7 @@ python live_runner.py --prefer-yfinance
 Run once per day after market close. Example cron on Linux/macOS:
 
 ```cron
-35 16 * * 1-5 cd /path/to/Trading\ I/Live && python live_runner.py
+35 16 * * 1-5 cd /path/to/Live && python scripts/rebalance.py
 ```
 
 On Windows use Task Scheduler or Git Bash cron.
