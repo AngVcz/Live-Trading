@@ -26,12 +26,12 @@ LOG_DIR = REPO_ROOT / "logs"
 # Fixed regime-gate sleeve allocations. Each sums to 1.0. The LLM picks one; it
 # never edits these numbers.
 PROFILES: Dict[str, Dict[str, float]] = {
-    "aggressive": {"A": 0.30, "B": 0.25, "rates": 0.10, "bear": 0.05, "cta": 0.30},
-    "balanced": {"A": 0.20, "B": 0.20, "rates": 0.20, "bear": 0.20, "cta": 0.20},
-    "passive": {"A": 0.10, "B": 0.10, "rates": 0.30, "bear": 0.25, "cta": 0.25},
+    "aggressive": {"A": 0.30, "B": 0.25, "rates": 0.10, "BIL_ballast": 0.05, "cta": 0.30},
+    "balanced": {"A": 0.20, "B": 0.20, "rates": 0.20, "BIL_ballast": 0.20, "cta": 0.20},
+    "passive": {"A": 0.10, "B": 0.10, "rates": 0.30, "BIL_ballast": 0.25, "cta": 0.25},
 }
 
-_SLEEVE_ORDER = ["A", "B", "rates", "bear", "cta"]
+_SLEEVE_ORDER = ["A", "B", "rates", "BIL_ballast", "cta"]
 _MIKTEX_BIN = Path(r"C:\Users\angve\AppData\Local\Programs\MiKTeX\miktex\bin\x64")
 
 
@@ -88,17 +88,17 @@ def analyze(run_date: date) -> Dict:
     prompt = (
         "You are a macro/market analyst for a dual-momentum ETF portfolio with five "
         "sleeves: equity-momentum engines A and B, a rates sleeve (TLT/IEF/BIL by "
-        "200-day trend), a bear sleeve (SH when SPY < SMA200, else BIL), and a CTA "
-        "proxy (PDBC/DBMF/KMLM in uptrend, else BIL).\n\n"
+        "200-day trend), a BIL ballast sleeve (cash proxy; replaces the SH bear sleeve), "
+        "and a CTA proxy (PDBC/DBMF/KMLM in uptrend, else BIL).\n\n"
         f"Today is {run_date.isoformat()}. Use web search to gather the latest "
         "financial and macroeconomic news: central banks (Fed/ECB), inflation/CPI, "
         "employment, GDP, geopolitics, equity-market moves, VIX, Treasury yields, "
         "and commodities.\n\n"
         "Write a concise market analysis (3-6 short paragraphs). Then recommend "
         "exactly ONE of three fixed sizing profiles for today:\n"
-        "  - aggressive: risk-on tilt (more A/B equity momentum and CTA, less defensive)\n"
+        "  - aggressive: risk-on tilt (more A/B equity momentum and CTA, less BIL ballast)\n"
         "  - balanced:   neutral, 20% in each sleeve (the systematic baseline)\n"
-        "  - passive:    risk-off tilt (more rates/bear/defensive, less equity)\n\n"
+        "  - passive:    risk-off tilt (more rates/BIL ballast/defensive, less equity)\n\n"
         "Optionally prefix your response with up to 5 one-line headline bullets "
         "(each line starting with '- '). End your response with exactly two lines:\n"
         "RECOMMENDED_PROFILE: <aggressive|balanced|passive>\n"

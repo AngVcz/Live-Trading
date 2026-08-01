@@ -24,7 +24,7 @@ Combine two equity dual-momentum engines (A and B) with three truly diversifying
 
 - A and B are highly correlated, so switching rules between them add no OOS value.
 - C (Triple EMA + Macro + Kurt) was discarded as a primary engine due to look-ahead and overfit risk.
-- The diversifier sleeves (Rates, BIL ballast, CTA proxy) break correlation and approximately double Sharpe and halve MaxDD relative to 100%-invested A+B alone.
+- The diversifier sleeves (Rates, BIL ballast, CTA proxy) break correlation and halve MaxDD while preserving Sharpe (the optional rates band gate improves it slightly) relative to 100%-invested A+B alone.
 - The SH bear sleeve was removed in favor of BIL ballast after it was found to be strictly dominated by cash on both Sharpe and MaxDD in the realized sample.
 - Gold is omitted because it degrades Calmar in the OOS sample.
 
@@ -206,11 +206,11 @@ Flow:
 
 The three profiles are fixed regime-gate sleeve allocations (each sums to 100%):
 
-| Profile    | A    | B    | rates | bear | cta  | tilt     |
-|------------|------|------|-------|------|------|----------|
-| aggressive | 30%  | 25%  | 10%   | 5%   | 30%  | risk-on  |
-| balanced   | 20%  | 20%  | 20%   | 20%  | 20%  | neutral  |
-| passive    | 10%  | 10%  | 30%   | 25%  | 25%  | risk-off |
+| Profile    | A    | B    | rates | BIL ballast | cta  | tilt     |
+|------------|------|------|-------|-------------|------|----------|
+| aggressive | 30%  | 25%  | 10%   | 5%          | 30%  | risk-on  |
+| balanced   | 20%  | 20%  | 20%   | 20%         | 20%  | neutral  |
+| passive    | 10%  | 10%  | 30%   | 25%         | 25%  | risk-off |
 
 The LLM picks one of these; it never edits the numbers. If the LLM call fails, the
 report still ships the three deterministic tables with an "analysis unavailable"
