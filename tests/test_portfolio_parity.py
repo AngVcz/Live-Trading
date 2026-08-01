@@ -68,6 +68,30 @@ def test_empty_sleeve_to_bil():
     assert abs(sum(out.values()) - 1.0) < 1e-9
 
 
+# (b2) discretionary profile form: apply_profile returns a Series with BIL_ballast
+# and NO 'bear' key. decompose must not KeyError on .loc['bear'] and must route the
+# BIL_ballast budget to BIL. Regression: the bear->BIL_ballast reconciliation renamed
+# PROFILES but decompose still hardcoded .loc['bear'], so morning_report.py crashed
+# building the first profile table (uncaught: self-check + pytest never decompose).
+def test_decompose_accepts_profile_form_bil_ballast_no_bear_key():
+    from live.discretionary import apply_profile
+    from live.portfolio import decompose_target_to_tickers
+
+    prices = _flat_panel(260, SLEEVE_TICKERS)
+    weight_a = pd.Series(dtype=float)
+    weight_b = pd.Series(dtype=float)
+    sleeve = apply_profile("balanced")  # index A,B,rates,BIL_ballast,cta — NO bear
+
+    out = decompose_target_to_tickers(sleeve, weight_a, weight_b, prices)
+
+    # No KeyError; sums to 1.0; flat prices floor every sleeve to BIL, so the
+    # 20% BIL_ballast is part of an all-BIL book (BIL == 1.0). SH is never
+    # deployed because the profile form carries no bear budget.
+    assert abs(sum(out.values()) - 1.0) < 1e-9
+    assert abs(out["BIL"] - 1.0) < 1e-9
+    assert out.get("SH", 0.0) < 1e-9
+
+
 # (c) gate shift: a regime flip on day T affects the sleeve return on T+1, not T.
 def test_gate_shift_delays_regime_flip_one_day():
     from live.portfolio import _bear_sleeve, _bear_weights

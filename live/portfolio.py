@@ -412,7 +412,10 @@ def decompose_target_to_tickers(
     out[rates_today] = out.get(rates_today, 0.0) + float(target_weights.loc["rates"])
 
     # Bear sleeve: disabled means the whole bear budget is already in BIL_ballast.
-    bear_budget = float(target_weights.loc["bear"])
+    # ponytail: .get (not .loc) — the discretionary profile form (apply_profile)
+    # carries BIL_ballast and NO 'bear' key, so a hardcoded .loc['bear'] would
+    # KeyError. build_live_weights emits both keys; either form works here.
+    bear_budget = float(target_weights.get("bear", 0.0))
     if bear_budget > 0:
         bear_w = _bear_weights(prices)
         bear_today = "SH" if ("SH" in bear_w.columns and bear_w.loc[today, "SH"] > 0) else "BIL"
