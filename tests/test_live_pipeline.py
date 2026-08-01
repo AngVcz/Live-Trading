@@ -62,12 +62,17 @@ def test_portfolio_weights_sum_to_one():
     config = SleeveConfig()
     sleeve_weights = build_live_weights(ret_a, ret_b, sleeve_rets, config)
     assert abs(sleeve_weights.sum() - 1.0) < 1e-6
+    # Default config now disables bear; confirm the freed 20% is routed to BIL ballast.
+    assert abs(sleeve_weights.get("BIL_ballast", 0.0) - 0.2) < 1e-9
+    assert abs(sleeve_weights.get("bear", 0.0)) < 1e-9
 
     target_tickers = decompose_target_to_tickers(
         sleeve_weights, weights_a.iloc[-1], weights_b.iloc[-1], prices
     )
     assert abs(sum(target_tickers.values()) - 1.0) < 1e-6
     assert all(w >= -1e-6 for w in target_tickers.values())
+    # BIL carries at least the freed bear budget (more if A/B residuals also floor to BIL).
+    assert target_tickers.get("BIL", 0.0) >= 0.2 - 1e-6
 
 
 def test_risk_guard_blocks_stale_data():

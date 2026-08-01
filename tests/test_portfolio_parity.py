@@ -266,3 +266,123 @@ def test_shared_gate_helper_timing_difference():
     for T in (241, 242, 243):
         expected = (w.shift(1).iloc[T] * rets.iloc[T]).sum()
         assert abs(sleeve.iloc[T] - expected) < 1e-9
+
+
+# (g) rates sleeve knob check: band and hysteresis_n both produce valid weights
+# and actually change the regime path (the knob turns), but they always keep
+# exactly one of TLT/IEF/BIL at 1.0 per day.
+def test_rates_weights_band_and_hysteresis_knobs_turn():
+    from live.portfolio import _rates_weights
+
+    n = 260
+    prices = _flat_panel(n, ["TLT", "IEF", "BIL"]).copy()
+    # Make the second half trend up (above SMA) so there is a regime to switch into.
+    prices.loc[:, "TLT"] = 100.0
+    prices.iloc[200:, prices.columns.get_loc("TLT")] = 110.0
+    prices.loc[:, "IEF"] = 100.0
+    prices.iloc[200:, prices.columns.get_loc("IEF")] = 105.0
+    prices.loc[:, "BIL"] = 100.0
+
+    w_default = _rates_weights(prices)
+    w_hyst5 = _rates_weights(prices, hysteresis_n=5)
+    w_band = _rates_weights(prices, band=0.02)
+
+    for w in (w_default, w_hyst5, w_band):
+        assert list(w.columns) == ["TLT", "IEF", "BIL"]
+        assert ((w.sum(axis=1) - 1.0).abs() < 1e-9).all()
+        assert ((w == 0.0) | (w == 1.0)).all().all()
+        assert (w.sum(axis=1) == 1.0).all()
+
+    # The alternative gates must differ from the default (otherwise they are not
+    # turning a knob).
+    assert not (w_hyst5 == w_default).all().all()
+    assert not (w_band == w_default).all().all()
+
+    # Band + hysteresis_n together is not (yet) supported.
+    try:
+        _rates_weights(prices, band=0.01, hysteresis_n=3)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("band + hysteresis_n should raise ValueError")
+
+
+# (h) band gate shift: a regime flip on day T affects the sleeve return on T+1,
+# exactly like the hysteresis gate.
+def test_band_gate_shift_delays_regime_flip_one_day():
+    from live.portfolio import _rates_weights, _net_sleeve_return
+
+    n = 260
+    prices = _flat_panel(n, ["TLT", "IEF", "BIL"]).copy()
+    prices.loc[:, "TLT"] = 100.0
+    # TLT jumps above the band threshold on day 240, creating a flip.
+    prices.iloc[240:, prices.columns.get_loc("TLT")] = 110.0
+    # TLT earns the return on the day AFTER the flip (day 241) to prove shift(1).
+    # We make TLT flat on day 240 itself (the jump is close-to-close from 239->240),
+    # and give it a +10% pop on day 241, so the only way to capture it is via w[240].
+    prices.loc[:, "IEF"] = 100.0
+    prices.iloc[241, prices.columns.get_loc("TLT")] = 121.0
+    prices.loc[:, "BIL"] = 100.0
+
+    rets = prices.pct_change(fill_method=None)
+    w = _rates_weights(prices, band=0.02)
+    sleeve = _net_sleeve_return(w, rets, 0.0)
+
+    # The day of the flip (240) still uses yesterday's weight (BIL -> 0 return).
+    assert abs(sleeve.iloc[240] - 0.0) < 1e-9
+    # Day 241 uses the new weight (TLT) and earns TLT's +10% return.
+    assert abs(sleeve.iloc[241] - 0.10) < 1e-9
+
+
+# (i) disabled bear routes the bear budget to BIL and the live decompose output
+# still sums to 1.0.
+def test_disable_bear_routes_to_bil():
+    from live.portfolio import (
+        SleeveConfig, build_live_weights, build_sleeve_returns,
+        decompose_target_to_tickers,
+    )
+
+    prices = _flat_panel(260, SLEEVE_TICKERS)
+    ret_a = pd.Series(0.0, index=prices.index)
+    ret_b = pd.Series(0.0, index=prices.index)
+    sleeves = build_sleeve_returns(prices)
+
+    config_enabled = SleeveConfig(weight_a=0.2, weight_b=0.2, weight_rates=0.2,
+                                  weight_bear=0.2, weight_cta=0.2,
+                                  disable_bear=False)
+    config_disabled = SleeveConfig(weight_a=0.2, weight_b=0.2, weight_rates=0.2,
+                                   weight_bear=0.2, weight_cta=0.2,
+                                   disable_bear=True)
+
+    w_enabled = build_live_weights(ret_a, ret_b, sleeves, config_enabled)
+    w_disabled = build_live_weights(ret_a, ret_b, sleeves, config_disabled)
+
+    assert abs(w_enabled.sum() - 1.0) < 1e-9
+    assert abs(w_disabled.sum() - 1.0) < 1e-9
+    assert abs(w_enabled["bear"] - 0.2) < 1e-9
+    assert abs(w_disabled["bear"] - 0.0) < 1e-9
+    assert abs(w_disabled["BIL_ballast"] - 0.2) < 1e-9
+
+    # Decompose also sums to 1.0; with flat prices everything floors to BIL.
+    out = decompose_target_to_tickers(
+        w_disabled, pd.Series(dtype=float), pd.Series(dtype=float), prices
+    )
+    assert abs(sum(out.values()) - 1.0) < 1e-9
+    assert out["BIL"] >= 0.2 - 1e-9
+
+
+# (j) build_sleeve_returns respects rates_band parameter.
+def test_build_sleeve_returns_uses_rates_band():
+    from live.portfolio import build_sleeve_returns
+
+    prices = _flat_panel(260, SLEEVE_TICKERS).copy()
+    prices.loc[:, "TLT"] = 100.0
+    prices.iloc[200:, prices.columns.get_loc("TLT")] = 110.0
+
+    sl_default = build_sleeve_returns(prices)
+    sl_band = build_sleeve_returns(prices, rates_band=0.02)
+
+    # Both produce valid sleeves; the band version must differ (knob turns).
+    assert list(sl_default.columns) == ["rates", "bear", "cta"]
+    assert list(sl_band.columns) == ["rates", "bear", "cta"]
+    assert not (sl_band["rates"] == sl_default["rates"]).all()

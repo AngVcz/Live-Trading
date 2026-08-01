@@ -17,14 +17,15 @@ Combine two equity dual-momentum engines (A and B) with three truly diversifying
 | Strategy A    | 20%    | Phase 3 mom_corr: momentum + correlation, top 5 |
 | Strategy B    | 20%    | Top-3 Dual-Momentum: pure momentum, top 3 |
 | Rates sleeve  | 20%    | Bond trend: TLT / IEF / BIL |
-| Bear sleeve   | 20%    | SH when SPY < SMA200, otherwise BIL |
+| BIL ballast   | 20%    | Cash proxy; replaces the SH bear sleeve, which was dominated by cash on both Sharpe and MaxDD |
 | CTA proxy     | 20%    | PDBC / DBMF / KMLM in uptrend, otherwise BIL |
 
 ### Why this structure
 
 - A and B are highly correlated, so switching rules between them add no OOS value.
 - C (Triple EMA + Macro + Kurt) was discarded as a primary engine due to look-ahead and overfit risk.
-- The three sleeves (Rates, Bear, CTA proxy) break correlation and approximately double Sharpe and triple Calmar in backtest.
+- The diversifier sleeves (Rates, BIL ballast, CTA proxy) break correlation and approximately double Sharpe and halve MaxDD relative to 100%-invested A+B alone.
+- The SH bear sleeve was removed in favor of BIL ballast after it was found to be strictly dominated by cash on both Sharpe and MaxDD in the realized sample.
 - Gold is omitted because it degrades Calmar in the OOS sample.
 
 ---
@@ -57,18 +58,18 @@ Combine two equity dual-momentum engines (A and B) with three truly diversifying
 ### Sleeve level
 
 ```
-A       = 20%
-B       = 20%
-rates   = 20%
-bear    = 20%
-cta     = 20%
+A           = 20%
+B           = 20%
+rates       = 20%
+bil_ballast = 20%   # freed from the SH bear sleeve; strictly dominated by cash
+cta         = 20%
 ```
 
 ### Ticker level
 
 - A and B: equal-weight within their selected top-N.
 - Rates: 100% in the best of TLT / IEF / BIL based on SMA200.
-- Bear: 100% in SH if SPY < SMA200, otherwise BIL.
+- BIL ballast: 20% of NAV held in BIL (cash proxy); replaces the former SH bear sleeve, which was dominated by cash on both Sharpe and MaxDD.
 - CTA proxy: equal-weight among PDBC / DBMF / KMLM in uptrend, otherwise BIL.
 
 ### Account scaling

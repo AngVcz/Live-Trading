@@ -25,16 +25,23 @@ class SleeveConfig:
     rebalance_freq: str = "Y"          # 'Y' = annual, 'M' = monthly, 'W' = weekly
     drift_threshold: float = 0.10        # absolute deviation that triggers rebalance
     commission_bps: float = 10.0
+    rates_band: Optional[float] = None  # SMA200 band for rates gate; None = default hysteresis
+    disable_bear: bool = True           # SH bear sleeve is strictly dominated by BIL ballast;
+                                        # freed 20% sits in cash (BIL) until a real diversifier clears the bar.
 
     @property
     def weights(self) -> Dict[str, float]:
-        return {
+        out = {
             "A": self.weight_a,
             "B": self.weight_b,
             "rates": self.weight_rates,
             "bear": self.weight_bear,
             "cta": self.weight_cta,
         }
+        if self.disable_bear:
+            out["bear"] = 0.0
+            out["BIL_ballast"] = self.weight_bear
+        return out
 
 
 SLEEVE_TICKERS = ["SPY", "TLT", "IEF", "GLD", "PDBC", "KMLM", "DBMF", "VIXM", "SH", "BIL", "VIXY", "PSQ"]
@@ -83,18 +90,78 @@ def _hysteresis_regime(condition: pd.Series, n: int = HYSTERESIS_N) -> pd.Series
     return pd.Series(out, index=condition.index)
 
 
-def _rates_weights(prices: pd.DataFrame) -> pd.DataFrame:
-    """Per-constituent allocation weights for the rates sleeve (hysteresis'd).
+def _band_regime(above: pd.Series, below: pd.Series) -> pd.Series:
+    """Stateful regime flag with asymmetric entry/exit thresholds (SMA band).
+
+    Enters the 'on' state the first time ``above`` is True and leaves it the
+    first time ``below`` is True. The dead-zone between the two thresholds
+    suppresses whipsaw around a central level (e.g. SMA200). The helper produces
+    the flag *on a date* from that date's close, matching ``_hysteresis_regime``
+    timing so the backtest and live paths stay aligned.
+    """
+    vals_a = np.asarray(above.fillna(False).astype(bool))
+    vals_b = np.asarray(below.fillna(False).astype(bool))
+    out = np.zeros(len(vals_a), dtype=bool)
+    state = bool(vals_a[0])
+    for i in range(len(vals_a)):
+        a = bool(vals_a[i])
+        b = bool(vals_b[i])
+        if state:
+            if b:
+                state = False
+        else:
+            if a:
+                state = True
+        out[i] = state
+    return pd.Series(out, index=above.index)
+
+
+def _rates_weights(
+    prices: pd.DataFrame,
+    band: Optional[float] = None,
+    hysteresis_n: Optional[int] = None,
+) -> pd.DataFrame:
+    """Per-constituent allocation weights for the rates sleeve.
 
     Exactly one of TLT / IEF / BIL holds 1.0 each day (TLT wins over IEF).
+
+    Parameters
+    ----------
+    band : float, optional
+        If given, entry/exit use an SMA200 band: enter long when price is
+        ``(1+band)`` above the SMA and exit when price is ``(1-band)`` below.
+        This is the primary whipsaw-fix candidate for the rates sleeve.
+    hysteresis_n : int, optional
+        If ``band`` is None, N-consecutive-closes filter applied to the raw
+        price>SMA200 condition. If ``band`` is given, the band state machine
+        itself is immediate; this parameter is reserved for future band+hysteresis
+        combos and currently must be None.
     """
     available = [t for t in ["TLT", "IEF", "BIL"] if t in prices.columns]
     if len(available) < 3:
         raise ValueError(f"Rates sleeve missing tickers: {available}")
+    if band is not None and hysteresis_n is not None:
+        raise ValueError("band+hysteresis_n combo not yet implemented; pass one or the other.")
+
     sma = prices[["TLT", "IEF", "BIL"]].rolling(TREND_WINDOW, min_periods=126).mean()
-    long_tlt = _hysteresis_regime(prices["TLT"] > sma["TLT"])
-    long_ief = _hysteresis_regime(prices["IEF"] > sma["IEF"])
     w = pd.DataFrame(0.0, index=prices.index, columns=["TLT", "IEF", "BIL"])
+
+    if band is not None:
+        upper = 1.0 + band
+        lower = 1.0 - band
+        long_tlt = _band_regime(
+            prices["TLT"] > sma["TLT"] * upper,
+            prices["TLT"] < sma["TLT"] * lower,
+        )
+        long_ief = _band_regime(
+            prices["IEF"] > sma["IEF"] * upper,
+            prices["IEF"] < sma["IEF"] * lower,
+        )
+    else:
+        n = hysteresis_n if hysteresis_n is not None else HYSTERESIS_N
+        long_tlt = _hysteresis_regime(prices["TLT"] > sma["TLT"], n=n)
+        long_ief = _hysteresis_regime(prices["IEF"] > sma["IEF"], n=n)
+
     w["TLT"] = long_tlt.astype(float)
     w["IEF"] = (~long_tlt & long_ief).astype(float)
     w["BIL"] = (~long_tlt & ~long_ief).astype(float)
@@ -185,9 +252,16 @@ def build_sleeve_returns(
     prices: pd.DataFrame,
     tickers: Optional[List[str]] = None,
     cost_bps: float = 10.0,
+    rates_band: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     Compute daily returns for the three diversifier sleeves.
+
+    Parameters
+    ----------
+    rates_band : float, optional
+        SMA200 band fraction passed to ``_rates_weights``. None uses the
+        default N=2 hysteresis gate.
 
     Returns
     -------
@@ -202,7 +276,7 @@ def build_sleeve_returns(
 
     cost_rate = cost_bps / 1e4
     return pd.DataFrame({
-        "rates": _net_sleeve_return(_rates_weights(prices), rets, cost_rate),
+        "rates": _net_sleeve_return(_rates_weights(prices, band=rates_band), rets, cost_rate),
         "bear": _net_sleeve_return(_bear_weights(prices), rets, cost_rate),
         "cta": _net_sleeve_return(_cta_weights(prices), rets, cost_rate),
     }, index=prices.index)
@@ -253,8 +327,9 @@ def build_live_weights(
         "A": config.weight_a,
         "B": config.weight_b,
         "rates": config.weight_rates,
-        "bear": config.weight_bear,
+        "bear": 0.0 if config.disable_bear else config.weight_bear,
         "cta": config.weight_cta,
+        "BIL_ballast": config.weight_bear if config.disable_bear else 0.0,
     })
 
     # last_weights es un Series de tickers (persistido en state.json). Si el índice
@@ -298,6 +373,7 @@ def decompose_target_to_tickers(
     weight_a: pd.Series,
     weight_b: pd.Series,
     prices: pd.DataFrame,
+    rates_band: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     Convert sleeve-level weights into individual ticker target weights.
@@ -326,8 +402,8 @@ def decompose_target_to_tickers(
 
     today = prices.index[-1]
 
-    # Rates sleeve: today's allocation from the shared hysteresis'd gate.
-    rates_w = _rates_weights(prices)
+    # Rates sleeve: today's allocation from the shared gate (hysteresis or band).
+    rates_w = _rates_weights(prices, band=rates_band)
     rates_today = "BIL"
     for t in ["TLT", "IEF", "BIL"]:
         if t in rates_w.columns and rates_w.loc[today, t] > 0:
@@ -335,10 +411,17 @@ def decompose_target_to_tickers(
             break
     out[rates_today] = out.get(rates_today, 0.0) + float(target_weights.loc["rates"])
 
-    # Bear sleeve: today's allocation from the shared hysteresis'd gate.
-    bear_w = _bear_weights(prices)
-    bear_today = "SH" if ("SH" in bear_w.columns and bear_w.loc[today, "SH"] > 0) else "BIL"
-    out[bear_today] = out.get(bear_today, 0.0) + float(target_weights.loc["bear"])
+    # Bear sleeve: disabled means the whole bear budget is already in BIL_ballast.
+    bear_budget = float(target_weights.loc["bear"])
+    if bear_budget > 0:
+        bear_w = _bear_weights(prices)
+        bear_today = "SH" if ("SH" in bear_w.columns and bear_w.loc[today, "SH"] > 0) else "BIL"
+        out[bear_today] = out.get(bear_today, 0.0) + bear_budget
+
+    # BIL ballast from disabled bear: add it on top of any BIL already deployed.
+    ballast = float(target_weights.get("BIL_ballast", 0.0))
+    if ballast > 0:
+        out["BIL"] = out.get("BIL", 0.0) + ballast
 
     # CTA sleeve: today's allocation from the shared hysteresis'd gate (equal-weight
     # of selected proxies, BIL floor) -- identical selection to the backtest path.
