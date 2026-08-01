@@ -268,16 +268,26 @@ Re-run with the post-`fix/live-backtest-parity` code: sleeve returns are **net o
 The panel calendar is the **union** of equity frames (a late-listed ticker such
 as KMLM is NaN before its first bar instead of truncating every sleeve to 2021-07),
 and a 2014–2021 sleeve-price backfill is fetched on first run. A/B core returns are
-unchanged (pre-computed research CSVs).
+unchanged (pre-computed research CSVs). The bear sleeve is **disabled by default
+(`disable_bear=True`)**: that 20% routes to **BIL ballast** (the cash proxy, held
+constantly at ~T-bill yield, ~0 turnover) instead of the SH/BIL bear sleeve, which
+was strictly dominated by cash on both Sharpe and MaxDD.
 
-These fixes removed the optimistic bias present in the earlier gross / look-ahead
-sleeve backtest (which reported ~Sharpe 2.2 / Calmar 2.3 over 2015–2025). The
-sleeves still add return but no longer improve risk-adjusted return over this span.
+These fixes removed the optimistic bias in the earlier gross / look-ahead sleeve
+backtest (which reported ~Sharpe 2.2 / Calmar 2.3 over 2015–2025). Against
+100%-invested A+B alone (Sharpe 1.20, MaxDD -21.6%), the diversifier sleeves
+halve MaxDD while preserving Sharpe (Sharpe 1.21, MaxDD -9.3%); absolute return
+is lower because 60% sits in diversifiers rather than A/B equity.
 
 | Period | CAGR | Vol | Sharpe | Max DD | Calmar |
 |--------|------|-----|--------|--------|--------|
-| 2015-2025 | 7.9% | 7.8% | 1.01 | -10.03% | 0.79 |
-| OOS 2020-2025 | 10.0% | 9.1% | 1.10 | -8.79% | 1.14 |
+| IS 2015-2019 | 6.6% | 5.9% | 1.12 | -8.49% | 0.78 |
+| OOS 2020-2025 | 11.3% | 8.6% | 1.30 | -9.25% | 1.23 |
+| Full 2015-2025 | 9.2% | 7.5% | 1.21 | -9.25% | 0.99 |
+
+Beta / alpha (CAPM, Jensen's, rf = BIL): vs **SPY** beta 0.14, alpha +5.2%/yr
+(corr 0.34); vs **60/40** (SPY 60% / IEF 40%) beta 0.26, alpha +5.0%/yr (corr 0.37).
+The low market beta reflects 60% in non-equity diversifiers.
 
 Reproduce with `notebooks/A_B_Diversifier_Analytics.ipynb` (or the scratch script
 mirroring cells 1/3/5/7). *Historical results do not guarantee future performance.*
