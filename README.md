@@ -261,17 +261,22 @@ Smoke tests do not call Alpaca; they use cached yfinance data.
 
 ## 12. Expected metrics (backtest)
 
-> **⚠️ STALE — pending re-run.** The figures below were produced BEFORE the
-> `fix/live-backtest-parity` changes (10 bps sleeve turnover costs, N=2 gate
-> hysteresis, removal of a `.shift` look-ahead in the sleeve backtest, and CTA
-> backtest/live parity). Those fixes remove optimistic bias, so the true
-> Sharpe/Calmar are expected to be **lower** than shown. Do not quote these
-> numbers until the backtest is re-run and this table updated. Tracked as a
-> follow-up (no backtest runner ships in this repo yet).
+Re-run with the post-`fix/live-backtest-parity` code: sleeve returns are **net of
+10 bps one-way turnover cost**, use **N=2 regime-gate hysteresis**, are
+**`.shift(1)` no-look-ahead**, and the CTA sleeve is at **backtest/live parity**.
+The panel calendar is the **union** of equity frames (a late-listed ticker such
+as KMLM is NaN before its first bar instead of truncating every sleeve to 2021-07),
+and a 2014–2021 sleeve-price backfill is fetched on first run. A/B core returns are
+unchanged (pre-computed research CSVs).
+
+These fixes removed the optimistic bias present in the earlier gross / look-ahead
+sleeve backtest (which reported ~Sharpe 2.2 / Calmar 2.3 over 2015–2025). The
+sleeves still add return but no longer improve risk-adjusted return over this span.
 
 | Period | CAGR | Vol | Sharpe | Max DD | Calmar |
 |--------|------|-----|--------|--------|--------|
-| 2015-2025 | 16.5% | 7.5% | 2.20 | -7.18% | 2.30 |
-| OOS 2020-2025 | 20.6% | - | 2.36 | -7.18% | 2.87 |
+| 2015-2025 | 7.9% | 7.8% | 1.01 | -10.03% | 0.79 |
+| OOS 2020-2025 | 10.0% | 9.1% | 1.10 | -8.79% | 1.14 |
 
-*Historical results do not guarantee future performance.*
+Reproduce with `notebooks/A_B_Diversifier_Analytics.ipynb` (or the scratch script
+mirroring cells 1/3/5/7). *Historical results do not guarantee future performance.*

@@ -5,8 +5,11 @@ All data is cached on disk under ``cache/`` (repo-local, gitignored) so backfill
 and restarts are fast and deterministic.
 
 Calendar/provenance notes:
-- The panel is built on the INTERSECTION of equity (non-crypto) frames' indexes,
-  so weekend crypto bars never leak into the equity calendar.
+- The panel is built on the UNION of equity (non-crypto) frames' indexes, so a
+  late-listed or delisted ticker (e.g. KMLM ~2021) becomes NaN before its first
+  bar instead of truncating every other sleeve to its listing date. Equity frames
+  are weekday-only (NYSE), so the union has no weekend rows; weekend crypto bars
+  are kept out by ``ffill(limit=1)`` onto that calendar (see fetch_panel).
 - Symbols not tradeable on Alpaca (^VIX, crypto/futures pairs) skip Alpaca and go
   straight to yfinance; the source that produced each series is recorded in
   ``panel.attrs["provenance"]`` (ticker -> "alpaca"|"yfinance").
@@ -278,10 +281,15 @@ def fetch_ohlcv(
             result = cached.loc[start:end].copy()
             result.attrs["source"] = sname
             return result
-        # Need to fetch: gap between cache and requested end (or no cache).
+        # Need to fetch: cache doesn't fully cover [start, end] (or no cache).
         try:
-            fetch_start = start
-            if not cached.empty:
+            if cached.empty or cached.index.min() > pd.Timestamp(start):
+                # Front gap (or no cache): backfill from `start`. Fetching the full
+                # range and merging (dedup, keep last) also covers any back gap.
+                # ponytail: forward-only here would silently drop [start, cache.min).
+                fetch_start = start
+            else:
+                # Back gap only: extend cheaply from the day after the cache's last bar.
                 fetch_start = (cached.index.max() + timedelta(days=1)).date()
             fresh = sfn(ticker, fetch_start, end)
             if not fresh.empty:
@@ -303,11 +311,13 @@ def fetch_panel(
 ) -> pd.DataFrame:
     """
     Fetch adjusted close prices for many tickers aligned to an EQUITY trading
-    calendar (the intersection of all non-crypto frames' indexes).
+    calendar (the UNION of all non-crypto frames' indexes).
 
-    Crypto frames are reindexed onto that calendar with ``ffill(limit=1)`` so a
-    weekend crypto close is carried forward at most one day; weekdays with no
-    recent crypto bar remain NaN (not fabricated). The panel has NO weekend rows.
+    A late-listed or delisted ticker is NaN before its first bar instead of
+    truncating the panel to its listing date (an intersection would). Crypto
+    frames are reindexed onto that calendar with ``ffill(limit=1)`` so a weekend
+    crypto close is carried forward at most one day; weekdays with no recent
+    crypto bar remain NaN (not fabricated). The panel has NO weekend rows.
 
     ``panel.attrs["provenance"]`` maps each ticker to the source that produced it
     (``"alpaca"`` or ``"yfinance"``).
@@ -341,12 +351,14 @@ def fetch_panel(
             stacklevel=2,
         )
 
-    # Intersection of equity frames' indexes = the trading calendar.
-    # NOTE: the intersection truncates history to the shortest-lived equity frame,
-    # so a late-listed or delisted ticker shrinks the backtest span.
+    # Union of equity frames' indexes = the trading calendar. A UNION (not
+    # intersection) preserves full history: a late-listed ticker becomes NaN
+    # before its first bar instead of truncating every other sleeve to its
+    # listing date. Equity frames are weekday-only (NYSE) so the union has no
+    # weekend rows; sleeve functions fall back to BIL where a ticker is NaN.
     cal = None
     for df in equity_frames.values():
-        cal = df.index if cal is None else cal.intersection(df.index)
+        cal = df.index if cal is None else cal.union(df.index)
     cal = cal.sort_values()
 
     aligned = pd.DataFrame(index=pd.DatetimeIndex(cal, name="date"), columns=tickers, dtype=float)

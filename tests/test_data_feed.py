@@ -33,7 +33,7 @@ def _tmp_cache(tmp_path, monkeypatch):
 
 
 # ==========================================================================
-# (a) Panel on equity-calendar intersection; crypto ffill(limit=1)
+# (a) Panel on equity-calendar UNION; crypto ffill(limit=1)
 # ==========================================================================
 def test_panel_no_weekend_rows_and_crypto_ffill_limit1(monkeypatch):
     weekdays = ["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-09", "2025-01-10",
@@ -91,6 +91,37 @@ def test_panel_raises_when_only_crypto_frames(monkeypatch):
     monkeypatch.setattr(dfd, "fetch_ohlcv", fake_fetch_ohlcv)
     with pytest.raises(RuntimeError, match="No equity"):
         dfd.fetch_panel(["BTC-USD"], date(2025, 1, 6), date(2025, 1, 10))
+
+
+def test_panel_union_preserves_history_with_late_listed_equity(monkeypatch):
+    """A late-listed equity (KMLM ~2021) must NOT truncate the panel to its
+    listing date. The calendar is the UNION of equity frames, so SPY's full
+    history survives and KMLM is NaN before its first bar (sleeve functions fall
+    back to BIL there). An intersection would collapse the panel to 2021-07."""
+    spy_idx = pd.bdate_range("2015-01-02", "2025-01-10")  # ~10y of weekdays
+    spy_df = _ohlcv(spy_idx, [100.0 + i for i in range(len(spy_idx))])
+    # KMLM lists mid-2021: its frame starts far later than SPY's.
+    kmlm_idx = pd.bdate_range("2021-07-01", "2025-01-10")
+    kmlm_df = _ohlcv(kmlm_idx, [50.0 + i for i in range(len(kmlm_idx))])
+
+    def fake_fetch_ohlcv(ticker, start, end, prefer_alpaca=True, **kw):
+        r = {"SPY": spy_df, "KMLM": kmlm_df}[ticker].copy()
+        r.attrs["source"] = "yfinance"
+        return r
+
+    monkeypatch.setattr(dfd, "fetch_ohlcv", fake_fetch_ohlcv)
+    panel = dfd.fetch_panel(["SPY", "KMLM"], date(2015, 1, 2), date(2025, 1, 10),
+                            prefer_alpaca=False)
+
+    # Full SPY history preserved (NOT truncated to KMLM's 2021-07 listing).
+    assert panel.index.min() == pd.Timestamp("2015-01-02")
+    # No weekend rows (union of weekday-only equity frames).
+    assert (panel.index.dayofweek < 5).all()
+    # KMLM is NaN before its first bar, real after.
+    assert pd.isna(panel.loc["2020-01-02", "KMLM"])
+    assert panel.loc["2021-07-01", "KMLM"] == 50.0
+    # SPY is real throughout.
+    assert panel["SPY"].notna().all()
 
 
 def test_panel_partial_equity_failure_warns_and_nan_column(monkeypatch):
@@ -303,6 +334,40 @@ def test_backtest_cache_hit_not_refreshed(monkeypatch):
 
     out = dfd.fetch_ohlcv("SPY", start, end, prefer_alpaca=False)
     assert out.attrs["source"] == "yfinance"
+
+
+def test_cache_front_gap_is_backfilled_not_truncated(monkeypatch):
+    """A cache that starts AFTER the requested start (front gap) must backfill the
+    missing front, not silently serve truncated history. Regression: the old
+    forward-only fetch set fetch_start=cache.max+1, dropped [start, cache.min),
+    and (when that made start>end) raised RuntimeError."""
+    now = date(2025, 7, 31)
+    monkeypatch.setattr(dfd, "_today", lambda: now)
+
+    # Seed a cache covering only 2021-07 .. 2025-12 (the real on-disk state).
+    seed_idx = pd.bdate_range("2021-07-01", "2025-12-31")
+    dfd._save_cache("SPY", "yfinance", _ohlcv(seed_idx, [100.0] * len(seed_idx)))
+
+    # yfinance returns the FULL requested range (it has SPY since 1990). The fix
+    # must ask for [start, end] (not cache.max+1 -> 2026 -> empty -> raise).
+    fetched = []
+    def fake_yf(ticker, s, e):
+        fetched.append((s, e))
+        idx = pd.bdate_range(s, e)
+        return _ohlcv(idx, [200.0] * len(idx))
+    monkeypatch.setattr(dfd, "_fetch_yfinance", fake_yf)
+    monkeypatch.setattr(dfd, "_fetch_alpaca",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("alpaca")))
+
+    out = dfd.fetch_ohlcv("SPY", date(2014, 1, 1), date(2025, 12, 31),
+                          prefer_alpaca=False)
+    # Front gap fetched from the requested start (not forward-only from the cache).
+    assert fetched and fetched[0][0] == date(2014, 1, 1)
+    # Returned series starts at the requested start (front backfilled), not 2021-07.
+    assert out.index.min() == pd.Timestamp("2014-01-01")
+    assert out.attrs["source"] == "yfinance"
+    # Cache extended back to 2014.
+    assert dfd._load_cache("SPY", "yfinance").index.min() == pd.Timestamp("2014-01-01")
 
 
 # ==========================================================================
