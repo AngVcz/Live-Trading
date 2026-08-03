@@ -210,9 +210,14 @@ class AlpacaExecutor:
                 "portfolio_value": sum(abs(v) for v in target.targets.values()) + target.expected_cash,
             }
             positions = {}
+            held_qty: Dict[str, float] = {}
         else:
             account = self.get_account()
-            positions = self.get_positions()
+            raw_positions = self.client.get_all_positions()
+            positions = {p.symbol: float(p.market_value) for p in raw_positions}
+            # ponytail: held share qty per symbol, to floor SELL orders (below).
+            held_qty = {p.symbol.upper(): float(p.qty)
+                        for p in raw_positions if getattr(p, "qty", None) is not None}
         equity = account["equity"]
 
         results: List[OrderResult] = []
@@ -245,6 +250,13 @@ class AlpacaExecutor:
             qty = self._qty_for_notional(notional, price)
             if qty <= 0:
                 continue
+            # ponytail: never SELL more shares than held. The runner often
+            # executes intraday, where latest_prices is the last CLOSE but
+            # current_dollar is the live mark-to-market; notional/price then
+            # exceeds the held qty and Alpaca rejects the SELL as insufficient.
+            # Floor to the held qty so a full sell clears the position exactly.
+            if side == "SELL":
+                qty = min(qty, held_qty.get(t, qty))
             orders.append({
                 "ticker": t,
                 "side": side,

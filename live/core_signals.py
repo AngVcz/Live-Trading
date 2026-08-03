@@ -61,7 +61,9 @@ UNIVERSE: List[str] = [
     "XLU", "XLP", "XLY", "XLB", "XLRE",
     "AAPL", "MSFT", "AMZN", "GOOGL", "NVDA",
     "META", "TSLA", "JPM",
-    "BTC-USD", "ETH-USD",
+    # ponytail: BTC-USD/ETH-USD dropped — not Alpaca-equity-orderable and trade 7
+    # days/week (calendar risk on an equity-session panel). Re-enable later as its
+    # own sleeve with correct Alpaca crypto symbols if crypto exposure is wanted.
 ]
 CASH_PROXY = "BIL"
 VIX_TICKER = "^VIX"
@@ -74,7 +76,15 @@ def _rsi(series: pd.Series, window: int = RSI_WINDOW) -> pd.Series:
     avg_gain = gain.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
     avg_loss = loss.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100.0 - 100.0 / (1.0 + rs)
+    rsi = 100.0 - 100.0 / (1.0 + rs)
+    # ponytail: set the zero-loss/zero-gain boundaries exactly instead of NaN.
+    # avg_loss==0 -> RSI 100 (gains, no losses); avg_gain==0 with losses -> RSI 0;
+    # flat (neither) -> 50. The old .replace(0, NaN) made the zero-loss case NaN,
+    # which then failed `momentum > RSI_THRESHOLD` and dropped the asset.
+    rsi = rsi.mask(avg_loss == 0, 100.0)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50.0)
+    return rsi
 
 
 def _ensemble_signals(close_panel: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
@@ -134,6 +144,18 @@ def _slow_trend_filter(close_panel: pd.DataFrame) -> pd.DataFrame:
     return (close_panel[available_universe] > sma252).astype(int)
 
 
+def _avg_offdiag_corr(corr_mat: pd.DataFrame) -> pd.Series:
+    """Per-asset average correlation EXCLUDING the self-diagonal (==1.0).
+
+    ``corr_mat`` is a rolling-corr frame with a (date, ticker) MultiIndex and ticker
+    columns. Sum and count both include the diagonal, so subtract 1 from each; the
+    count-1 denominator is the number of off-diagonal pairs and handles NaN pairs.
+    """
+    offdiag_sum = corr_mat.groupby(level=0).sum() - 1.0
+    offdiag_count = corr_mat.groupby(level=0).count() - 1
+    return offdiag_sum / offdiag_count.replace(0, np.nan)
+
+
 def _factor_scores(
     close_panel: pd.DataFrame,
     returns_panel: pd.DataFrame,
@@ -148,7 +170,10 @@ def _factor_scores(
     vol_score = 1.0 / vol.replace(0, np.nan)
 
     corr_mat = returns_panel[available_universe].rolling(CORR_LOOKBACK, min_periods=CORR_LOOKBACK // 2).corr()
-    avg_corr = corr_mat.groupby(level=0).mean()
+    # ponytail: exclude the self-correlation diagonal (==1.0) from the per-asset
+    # average — the old groupby(level=0).mean() added a guaranteed 1.0 to every
+    # score.
+    avg_corr = _avg_offdiag_corr(corr_mat)
     corr_score = 1.0 - avg_corr
 
     def rank01(df: pd.DataFrame) -> pd.DataFrame:
@@ -287,3 +312,22 @@ def build_core_returns(
         res_a[weight_cols],
         res_b[weight_cols],
     )
+
+
+if __name__ == "__main__":  # ponytail: one runnable check for the RSI boundary fix.
+    import numpy as np
+
+    rng = np.arange(100.0, 100.0 + RSI_WINDOW + 5)  # strictly rising -> no losses
+    up = pd.Series(rng)
+    rsi_up = float(_rsi(up).iloc[-1])
+    assert rsi_up == 100.0, f"monotonic-up RSI should be 100, got {rsi_up}"
+
+    down = pd.Series(-rng)  # strictly falling -> no gains
+    rsi_down = float(_rsi(down).iloc[-1])
+    assert rsi_down == 0.0, f"monotonic-down RSI should be 0, got {rsi_down}"
+
+    flat = pd.Series(np.full(RSI_WINDOW + 5, 100.0))  # no moves
+    rsi_flat = float(_rsi(flat).iloc[-1])
+    assert rsi_flat == 50.0, f"flat RSI should be 50, got {rsi_flat}"
+
+    print(f"core_signals self-check OK: RSI up={rsi_up} down={rsi_down} flat={rsi_flat}")

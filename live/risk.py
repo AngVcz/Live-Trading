@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -114,14 +115,50 @@ class RiskGuard:
                 f"FAIL: price data stale (last {last_price_date}, today {today})"
             )
 
-        # 2. Ticker availability.
+        # 2. Ticker availability + finite, recent last price.
+        # ponytail: `t in prices.columns` is false assurance — a failed download
+        # leaves an all-NaN column. Require a finite positive latest price AND that
+        # the ticker's own last_valid_index is recent vs the panel's last date (so a
+        # stale equity target can't hide behind a fresh panel date from another ticker).
+        last_price_date = prices.index[-1].date()
         for t, w in target_tickers.items():
-            if abs(w) > 1e-6 and t not in prices.columns:
+            if abs(w) <= 1e-6:
+                continue
+            if t not in prices.columns:
                 messages.append(f"FAIL: target ticker {t} not in price panel")
+                continue
+            # ponytail: last_valid_index is the source of truth for "latest price" --
+            # the last panel row may be NaN (recent gap/delisting) while an earlier
+            # bar is valid. A failed download leaves no valid bar at all.
+            lvi = prices[t].last_valid_index()
+            if lvi is None:
+                messages.append(
+                    f"FAIL: target ticker {t} has no valid price in panel (all-NaN/failed download)"
+                )
+                continue
+            last = prices[t].loc[lvi]
+            if not np.isfinite(last) or last <= 0:
+                messages.append(
+                    f"FAIL: target ticker {t} latest valid price non-finite/non-positive"
+                )
+                continue
+            if (last_price_date - lvi.date()).days > self.stale_data_days:
+                messages.append(
+                    f"FAIL: target ticker {t} last valid price stale (last valid {lvi.date()})"
+                )
 
         # 3. Single position limit (ticker-level).
+        # ponytail: BIL is the cash proxy (duration ~0, ~T-bill yield), not a risk
+        # position. Capping it at 50% blocks the systematic baseline whenever the
+        # rates AND cta sleeves both fall back to BIL (0.2 ballast + 0.2 rates->BIL
+        # + 0.2 cta->BIL = 0.6) and every risk-off discretionary profile. Exempt BIL
+        # only; every real risk position is still capped at max_single_position_pct.
         for t, w in target_tickers.items():
-            if w > self.max_single_position_pct:
+            if t == "BIL":
+                continue
+            # ponytail: abs() so a short (negative weight) above the cap in magnitude
+            # is still blocked — the old `w > max` let shorts bypass it entirely.
+            if abs(w) > self.max_single_position_pct:
                 messages.append(
                     f"FAIL: position {t} weight {w:.2%} exceeds max {self.max_single_position_pct:.2%}"
                 )

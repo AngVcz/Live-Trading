@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 from datetime import date
 
+import numpy as np
 import pandas as pd
 import pytest
 
 import live.state as state
 import scripts.rebalance as rb
+from live.alpaca_executor import OrderResult
 from live.risk import RiskGuard
 
 
@@ -22,11 +24,12 @@ from live.risk import RiskGuard
 class FakeExecutor:
     """Stand-in for AlpacaExecutor with a controlled book and a rebalance spy."""
 
-    def __init__(self, equity=100_000.0, positions=None, paper=True):
+    def __init__(self, equity=100_000.0, positions=None, paper=True, rebalance_orders=None):
         self.equity = equity
         self._positions = positions or {}
         self.paper = paper
         self.calls = []  # rebalance() call log
+        self._orders = rebalance_orders or []  # orders rebalance() returns
 
     def get_account(self):
         return {
@@ -41,7 +44,7 @@ class FakeExecutor:
 
     def rebalance(self, target, prices, dry_run=True):
         self.calls.append({"target": target, "prices": prices, "dry_run": dry_run})
-        return []
+        return list(self._orders)
 
 
 def _syn_prices(tickers, end="2025-01-06"):
@@ -150,6 +153,68 @@ def test_ab_concentration_cap_old_ticker_keyed_path_is_zero():
     assert res.ok
 
 
+# --- (b2) Single-position cap exempts the BIL cash proxy --------------------
+def test_single_position_cap_exempts_BIL_cash_proxy():
+    """BIL is the cash proxy (duration ~0); >50% must NOT block (systematic
+    baseline goes 60% BIL when rates+cta both fall back to cash)."""
+    guard = RiskGuard(max_single_position_pct=0.50)
+    prices = _syn_prices(["BIL", "SPY"])
+    res = guard.check(prices, {"BIL": 0.60, "SPY": 0.40},
+                      current_date=date(2025, 1, 6))
+    assert res.ok
+    assert not any("BIL" in m and "exceeds" in m for m in res.messages)
+
+
+def test_single_position_cap_still_flags_real_risk_position():
+    """A non-BIL position above the cap is still blocked (cash exemption only)."""
+    guard = RiskGuard(max_single_position_pct=0.50)
+    prices = _syn_prices(["SPY", "BIL"])
+    res = guard.check(prices, {"SPY": 0.60, "BIL": 0.40},
+                      current_date=date(2025, 1, 6))
+    assert not res.ok
+    assert any("SPY" in m and "exceeds" in m for m in res.messages)
+
+
+def test_single_position_cap_flags_short_via_abs():
+    """A negative-weight short above the cap in magnitude must be blocked (abs())."""
+    guard = RiskGuard(max_single_position_pct=0.50)
+    prices = _syn_prices(["SH", "BIL"])
+    res = guard.check(prices, {"SH": -0.60, "BIL": 0.40},
+                      current_date=date(2025, 1, 6))
+    assert not res.ok
+    assert any("SH" in m and "exceeds" in m for m in res.messages)
+
+
+def test_risk_guard_fails_on_all_nan_price_column():
+    """A failed download leaves an all-NaN column; the guard must FAIL on it.
+
+    `t in prices.columns` alone is false assurance — the column exists but has no
+    finite latest price, so the order would silently fail downstream.
+    """
+    idx = pd.to_datetime(["2025-01-02", "2025-01-06"])
+    prices = pd.DataFrame({"SPY": [100.0, 101.0], "BIL": [50.0, 50.5]}, index=idx)
+    prices["JPM"] = np.nan  # all-NaN column (simulated failed download)
+    guard = RiskGuard()
+    res = guard.check(prices, {"JPM": 0.2, "BIL": 0.2},
+                      current_date=date(2025, 1, 6))
+    assert not res.ok
+    assert any("JPM" in m and ("valid" in m or "NaN" in m) for m in res.messages)
+
+
+def test_risk_guard_fails_on_stale_per_ticker_last_valid():
+    """A ticker whose own last valid bar is stale must fail even if the panel's last
+    date is fresh (panel date can come from a different, fresher ticker)."""
+    idx = pd.to_datetime(["2025-01-02", "2025-01-06"])
+    prices = pd.DataFrame({"SPY": [100.0, 101.0], "BIL": [50.0, 50.5]}, index=idx)
+    # SPY has no bar on the last panel date -> last_valid_index is 2025-01-02.
+    prices.loc["2025-01-06", "SPY"] = np.nan
+    guard = RiskGuard(stale_data_days=2)
+    res = guard.check(prices, {"SPY": 0.2, "BIL": 0.2},
+                      current_date=date(2025, 1, 6))
+    assert not res.ok
+    assert any("SPY" in m and "stale" in m for m in res.messages)
+
+
 # --- (c) Ticker-level drift gate -------------------------------------------
 def test_drift_gate_skips_when_within_threshold(patch_paths):
     executor = FakeExecutor(equity=100_000.0,
@@ -158,7 +223,7 @@ def test_drift_gate_skips_when_within_threshold(patch_paths):
     prices = _syn_prices(list(targets))
     sleeve = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "bear": 0.2, "cta": 0.2})
 
-    orders, skipped = rb.decide_and_execute(
+    orders, skipped, _had_error = rb.decide_and_execute(
         executor, targets, sleeve, prices, date(2025, 3, 3),
         account=executor.get_account(), drift_threshold=0.05, dry_run=True,
     )
@@ -178,7 +243,7 @@ def test_drift_gate_fires_when_beyond_threshold(patch_paths):
     prices = _syn_prices(list(targets))
     sleeve = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "bear": 0.2, "cta": 0.2})
 
-    orders, skipped = rb.decide_and_execute(
+    orders, skipped, _had_error = rb.decide_and_execute(
         executor, targets, sleeve, prices, date(2025, 3, 3),
         account=executor.get_account(), drift_threshold=0.05, dry_run=False,
     )
@@ -194,7 +259,7 @@ def test_drift_gate_forces_execute_in_annual_window(patch_paths):
     prices = _syn_prices(list(targets))
     sleeve = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "bear": 0.2, "cta": 0.2})
 
-    orders, skipped = rb.decide_and_execute(
+    orders, skipped, _had_error = rb.decide_and_execute(
         executor, targets, sleeve, prices, date(2025, 1, 5),  # annual window
         account=executor.get_account(), drift_threshold=0.05, dry_run=True,
     )
@@ -214,7 +279,7 @@ def test_drift_gate_boundary_at_exact_threshold_skips(patch_paths):
     prices = _syn_prices(list(targets))
     sleeve = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "bear": 0.2, "cta": 0.2})
 
-    orders, skipped = rb.decide_and_execute(
+    orders, skipped, _had_error = rb.decide_and_execute(
         executor, targets, sleeve, prices, date(2025, 3, 3),
         account=executor.get_account(), drift_threshold=0.05, dry_run=True,
     )
@@ -231,7 +296,7 @@ def test_drift_gate_fires_on_current_only_ticker(patch_paths):
     prices = _syn_prices(["BIL", "SPY"])
     sleeve = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "bear": 0.2, "cta": 0.2})
 
-    orders, skipped = rb.decide_and_execute(
+    orders, skipped, _had_error = rb.decide_and_execute(
         executor, targets, sleeve, prices, date(2025, 3, 3),
         account=executor.get_account(), drift_threshold=0.05, dry_run=True,
     )
@@ -310,3 +375,58 @@ def test_peak_persisted_on_non_dry_run_success(monkeypatch, patch_paths):
     assert rc == 0
     assert update_calls == [123_000.0]                       # called once with real equity
     assert _read_peak(patch_paths["state"]) == 123_000.0     # peak updated to new high
+
+
+# --- (g) fatal order errors / dry-run state guard (#1, #7, #9) -------------
+def test_unpriced_held_ticker_is_fatal_and_skips_state(patch_paths):
+    """A held ticker with no price (#9) -> had_error, no rebalance, no last_weights."""
+    executor = FakeExecutor(positions={"UNKNOWN": 1000.0})  # held, not in prices
+    targets = {"BIL": 1.0}
+    prices = _syn_prices(["BIL"])
+    sleeve = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "bear": 0.2, "cta": 0.2})
+
+    orders, skipped, had_error = rb.decide_and_execute(
+        executor, targets, sleeve, prices, date(2025, 3, 3),
+        account=executor.get_account(), drift_threshold=0.05, dry_run=False,
+    )
+    assert had_error is True
+    assert skipped is False
+    assert orders == []               # rebalance never called
+    assert executor.calls == []       # no orders submitted
+    assert not patch_paths["state"].exists()   # last_weights NOT written
+
+
+def test_order_error_is_fatal_and_skips_state(patch_paths):
+    """An order coming back status='error' (#1) -> had_error, no last_weights."""
+    err = OrderResult(ticker="SPY", side="BUY", qty=10.0, notional=1000.0,
+                      status="error", message="rejected by broker")
+    executor = FakeExecutor(positions={"SPY": 20_000.0}, rebalance_orders=[err])
+    targets = {"SPY": 0.5, "BIL": 0.5}  # SPY 20% -> 50% drift forces execution
+    prices = _syn_prices(["SPY", "BIL"])
+    sleeve = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "bear": 0.2, "cta": 0.2})
+
+    orders, skipped, had_error = rb.decide_and_execute(
+        executor, targets, sleeve, prices, date(2025, 3, 3),
+        account=executor.get_account(), drift_threshold=0.05, dry_run=False,
+    )
+    assert had_error is True
+    assert skipped is False
+    assert len(executor.calls) == 1   # rebalance WAS called (price was fine)
+    assert not patch_paths["state"].exists()   # last_weights NOT written despite the run
+
+
+def test_dry_run_does_not_write_last_weights(patch_paths):
+    """A dry-run (#7) must not persist last_weights to production state."""
+    executor = FakeExecutor(positions={"SPY": 20_000.0})  # forces execution
+    targets = {"SPY": 0.5, "BIL": 0.5}
+    prices = _syn_prices(["SPY", "BIL"])
+    sleeve = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "bear": 0.2, "cta": 0.2})
+
+    orders, skipped, had_error = rb.decide_and_execute(
+        executor, targets, sleeve, prices, date(2025, 3, 3),
+        account=executor.get_account(), drift_threshold=0.05, dry_run=True,
+    )
+    assert had_error is False
+    assert skipped is False
+    assert len(executor.calls) == 1   # rebalance called (dry)
+    assert not patch_paths["state"].exists()   # dry-run never writes last_weights

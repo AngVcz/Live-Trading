@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -93,6 +94,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--prefer-yfinance", action="store_true", help="Use yfinance instead of Alpaca")
     p.add_argument("--profile", choices=list(PROFILES), default=None,
                    help="Trade a discretionary profile from logs/discretionary_<date>.json")
+    p.add_argument("--weights", type=str, default=None,
+                   help="Custom ticker->weight JSON override (e.g. '{\"BIL\":0.5867,...}'); "
+                        "bypasses both the systematic engine and --profile. Risk guardrails still apply.")
     p.add_argument("--drift-threshold", type=float, default=DEFAULT_DRIFT_THRESHOLD,
                    help="Ticker-level drift threshold above which a rebalance is forced (default 0.05)")
     return p.parse_args()
@@ -226,13 +230,18 @@ def decide_and_execute(
     account: Dict[str, float],
     drift_threshold: float,
     dry_run: bool,
-) -> Tuple[List, bool]:
+) -> Tuple[List, bool, bool]:
     """Apply the ticker-level drift gate; execute via ``executor.rebalance`` unless skipping.
 
-    Always logs target weights (to WEIGHT_LOG) and persists ``last_weights``. When the
+    Always logs target weights + orders to WEIGHT_LOG (audit trail, tagged dry_run).
+    Persists ``last_weights`` ONLY on a clean, non-dry-run, error-free run. When the
     current book is within ``drift_threshold`` of the targets (and it is not the annual
-    rebalance window) NO orders are placed; the targets are still logged. Returns
-    ``(orders, skipped)``.
+    rebalance window) NO orders are placed; the targets are still logged.
+
+    Returns ``(orders, skipped, had_error)``. ``had_error`` is True if any target or
+    held ticker could not be priced (a rejected/missing order would otherwise silently
+    no-op) or any submitted order came back with ``status == "error"``. The caller must
+    treat ``had_error`` as fatal: skip peak-equity persistence and exit non-zero.
     """
     equity = account["equity"]
     current_positions = executor.get_positions()
@@ -240,31 +249,57 @@ def decide_and_execute(
 
     sw_dict = sleeve_weights.to_dict() if hasattr(sleeve_weights, "to_dict") else dict(sleeve_weights)
 
+    orders: List = []
+    had_error = False
+
     if skipped:
         current_weights = positions_to_weights(current_positions, equity)
         max_drift = compute_max_drift(target_tickers, current_weights)
         print(f"DRIFT: max drift {max_drift:.2%} <= {drift_threshold:.2%}; "
               f"skipping execution (annual_window={is_annual_rebalance_window(run_date)})")
         print(f"Ticker targets (logged, not traded): {target_tickers}")
-        orders: List = []
     else:
         target_dollars = {t: w * equity for t, w in target_tickers.items()}
-        latest_prices = {t: float(prices[t].iloc[-1]) for t in target_tickers if t in prices.columns}
-        target_portfolio = TargetPortfolio(
-            date=pd.Timestamp(run_date),
-            targets=target_dollars,
-            expected_cash=equity * (1.0 - sum(abs(v) for v in target_tickers.values())),
-            strategy_weights=sw_dict,
-            notes=f"A+B+Diversifier live rebalance ({'paper' if executor.paper else 'LIVE'})",
+        # ponytail: price the UNION of target + current book so off-target holdings
+        # (a --weights/--profile target that is a subset of the held book) can be sold.
+        price_tickers = set(target_tickers) | set(current_positions)
+        latest_prices = {t: float(prices[t].iloc[-1]) for t in price_tickers if t in prices.columns}
+        # ponytail #3/#9: a missing TARGET price -> a rejected order; a missing HELD
+        # price -> a liquidation that silently no-ops and leaves the position forever.
+        # Both must be fatal, not silent skips. The risk guard already validated target
+        # tickers; this additionally covers held tickers outside the fetched universe.
+        unpriced = sorted(
+            t for t in price_tickers
+            if t not in latest_prices
+            or not math.isfinite(latest_prices[t])
+            or latest_prices[t] <= 0
         )
-        orders = executor.rebalance(target_portfolio, latest_prices, dry_run=dry_run)
+        if unpriced:
+            print(f"FATAL: no finite price for {len(unpriced)} ticker(s): {unpriced}")
+            had_error = True
+        else:
+            target_portfolio = TargetPortfolio(
+                date=pd.Timestamp(run_date),
+                targets=target_dollars,
+                expected_cash=equity * (1.0 - sum(abs(v) for v in target_tickers.values())),
+                strategy_weights=sw_dict,
+                notes=f"A+B+Diversifier live rebalance ({'paper' if executor.paper else 'LIVE'})",
+            )
+            orders = executor.rebalance(target_portfolio, latest_prices, dry_run=dry_run)
+            # ponytail #1: any order that errored makes the run fatal -- never save
+            # state as if the target was reached when orders were rejected.
+            errored = [o for o in orders if getattr(o, "status", "") == "error"]
+            if errored:
+                had_error = True
+                print(f"FATAL: {len(errored)} order(s) errored: "
+                      f"{[(o.ticker, o.message) for o in errored]}")
 
-    # ponytail: save_last_weights stores ticker-level weights; build_live_weights
-    # is sleeve-indexed so the index mismatch makes it a no-op there. The skip-path
-    # save is intentional for execution logging only (not for sleeve drift).
-    save_last_weights(target_tickers, run_date)
+    # Run-log always (audit, tagged dry_run). last_weights only on a clean, real run:
+    # order errors (#1) and dry-runs (#7) must not mutate production state.
     _save_run_log(run_date, target_tickers, orders, account, dry_run)
-    return orders, skipped
+    if not dry_run and not had_error:
+        save_last_weights(target_tickers, run_date)
+    return orders, skipped, had_error
 
 
 def main() -> int:
@@ -288,7 +323,18 @@ def main() -> int:
         return 1
     prices = sys_targets["prices"]
 
-    if args.profile:
+    if args.weights:
+        try:
+            target_tickers = {k: float(v) for k, v in json.loads(args.weights).items()}
+        except Exception as e:
+            print(f"FATAL: could not parse --weights JSON: {e}")
+            return 1
+        # ponytail: no sleeve vector for a custom override -> empty Series. The
+        # RiskGuard A+B 70% check then falls back to the ticker-keyed lookup (0),
+        # so a discretionary override is responsible for its own sleeve budget.
+        sleeve_weights = pd.Series(dtype=float)
+        print(f"Using custom --weights override ({len(target_tickers)} tickers).")
+    elif args.profile:
         try:
             target_tickers = _load_profile_tickers(run_date, args.profile)
         except Exception as e:
@@ -343,7 +389,7 @@ def main() -> int:
 
     # 6. Drift gate + execution.
     try:
-        orders, skipped = decide_and_execute(
+        orders, skipped, had_error = decide_and_execute(
             executor=executor,
             target_tickers=target_tickers,
             sleeve_weights=sleeve_weights,
@@ -357,9 +403,10 @@ def main() -> int:
         print(f"FATAL: execution failed: {e}")
         return 1
 
-    # 7. Persist peak equity ONLY on a non-dry-run, successful run (never from the
-    # hard-coded 100k dry-run equity). Order matters: state already saved above.
-    if not args.dry_run:
+    # 7. Persist peak equity ONLY on a clean, non-dry-run, error-free run (never from
+    # the hard-coded 100k dry-run equity, and never after an order error -- the book
+    # did not reach the target, so don't record a peak as if it did).
+    if not args.dry_run and not had_error:
         update_peak_equity(live_equity)
 
     print(f"Account equity: ${live_equity:,.2f}")
@@ -369,6 +416,11 @@ def main() -> int:
         for o in orders:
             print(f"  {o.side:4s} {o.ticker:6s} qty={o.qty:,.4f} "
                   f"notional=${o.notional:,.2f} status={o.status}")
+    if had_error:
+        print(f"[{datetime.now()}] Live runner finished with ORDER ERRORS; "
+              f"state NOT saved, peak NOT updated")
+        return 1
+    if not skipped:
         print(f"[{datetime.now()}] Live runner finished successfully")
     return 0
 

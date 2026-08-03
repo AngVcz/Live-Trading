@@ -406,6 +406,29 @@ def test_illiquid_sell_limit_price_is_above_close():
     assert req.limit_price == pytest.approx(100.5, abs=1e-6)
 
 
+# --- (e2) SELL qty floored to held (close-vs-mark oversell guard) -----------
+def test_sell_qty_floored_to_held_when_close_lt_mark():
+    """SELL qty never exceeds held qty when notional(live mark)/price(close)
+    oversizes it. Held 10 @ mark $120 = $1200; close price $100 -> 12 computed
+    -> must floor to 10 so Alpaca doesn't reject the SELL as insufficient qty."""
+    class FakePosQ:
+        def __init__(self, symbol, market_value, qty):
+            self.symbol = symbol
+            self.market_value = market_value
+            self.qty = qty
+    client = FakeClient(positions=[FakePosQ("SPY", 1200.0, 10.0)])
+    executor = AlpacaExecutor(client=client, fractional=True)
+    executor.rebalance(
+        _target({"SPY": 0.0}, cash=100_000.0, as_of="2025-03-03"),
+        {"SPY": 100.0},
+        dry_run=False,
+    )
+    assert len(client.submitted) == 1
+    req = client.submitted[0]
+    assert req.side == OrderSide.SELL
+    assert float(req.qty) == pytest.approx(10.0, abs=1e-6)
+
+
 # --- (f) buying-power re-fetch is NOT implemented (TODO honored) ----------
 def test_no_second_buying_power_fetch_between_sell_and_buy():
     """Two SELLs then two BUYs: get_account must be called exactly once
