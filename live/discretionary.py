@@ -37,6 +37,7 @@ _RISK_OFF_MULT = {"A": 0.5, "B": 0.5, "cta": 0.5}
 
 def _base_sleeve(sleeve: pd.Series) -> pd.Series:
     """Reindex to the five live sleeves ('bear' is 0 by default) as floats."""
+    assert abs(float(sleeve.get("bear", 0.0))) < 1e-9, "tilt engine assumes the bear sleeve is disabled"
     return sleeve.reindex(SLEEVE_ORDER).fillna(0.0).astype(float)
 
 
@@ -119,7 +120,8 @@ def build_tilt_options(
     """Build the three report options by tilting TODAY's systematic sizings.
 
     Pure and deterministic: no fetch, no LLM. Each option is
-    {"sleeve": {...}, "tickers": {...}, "note": str} with weights summing to 1.0.
+    {"sleeve": {...}, "tickers": {...}, "note": str} with weights summing to 1.0
+    for non-degenerate inputs (sum > 0).
     """
     from live.portfolio import decompose_target_to_tickers
 

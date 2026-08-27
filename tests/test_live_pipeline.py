@@ -140,3 +140,29 @@ def test_tilt_options_vix_overlay_disables_risk_on():
                for k in options["systematic"]["sleeve"])
     assert diff < 1e-12
     assert "disabled" in options["risk_on"]["note"]
+
+
+def test_tilt_edges_unfundable_and_caps():
+    from live.discretionary import _tilt_risk_on, _tilt_risk_off, _enforce_caps, _clip_tickers
+    import pandas as pd
+    # (a) unfundable risk-on -> identity + note
+    s = pd.Series({"A": 0.3, "B": 0.3, "rates": 0.05, "BIL_ballast": 0.05, "cta": 0.30})
+    out, note = _tilt_risk_on(s)
+    assert out.equals(s) and "unfundable" in note
+    # (b) cap repair preserves the sum and notes both repairs
+    s2 = pd.Series({"A": 0.60, "B": 0.20, "rates": 0.10, "BIL_ballast": 0.05, "cta": 0.05})
+    out2, note2 = _enforce_caps(s2)
+    assert abs(out2.sum() - 1.0) < 1e-9
+    assert out2["A"] + out2["B"] <= 0.70 + 1e-9
+    assert all(out2[k] <= 0.45 + 1e-9 for k in ("A", "B", "rates", "cta"))
+    assert "70%" in note2 and "45%" in note2
+    # (c) risk-off: rates cap binding vs no-uptrend routing
+    base = pd.Series({"A": 0.20, "B": 0.20, "rates": 0.20, "BIL_ballast": 0.20, "cta": 0.20})
+    up, _ = _tilt_risk_off(base, rates_in_uptrend=True)
+    down, _ = _tilt_risk_off(base, rates_in_uptrend=False)
+    assert abs(up["rates"] - 0.45) < 1e-9 and abs(up["BIL_ballast"] - 0.25) < 1e-9
+    assert abs(down["rates"] - 0.20) < 1e-9 and abs(down["BIL_ballast"] - 0.50) < 1e-9
+    assert abs(up.sum() - 1.0) < 1e-9 and abs(down.sum() - 1.0) < 1e-9
+    # (d) ticker clip spills to BIL
+    clipped = _clip_tickers({"SPY": 0.60, "BIL": 0.40})
+    assert abs(clipped["SPY"] - 0.35) < 1e-12 and abs(clipped["BIL"] - 0.65) < 1e-12
