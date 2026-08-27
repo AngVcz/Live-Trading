@@ -183,41 +183,41 @@ On Windows use Task Scheduler or Git Bash cron.
 
 ---
 
-## 8b. Discretionary 07:30 report (news overlay)
+## 8b. Discretionary 07:30 report (news overlay v2)
 
-An optional discretionary macro-news overlay that **does not change the
+An optional two-stage discretionary macro-news overlay that **does not change the
 reproducible/anti-overfit strategy**. The LLM only advises; all weights are
 deterministic.
 
 Flow:
 
 1. **07:30 (scheduled)** — `python scripts/morning_report.py` computes today's
-   systematic targets, asks the LLM (headless `claude` CLI with web search) for a
-   market analysis + a recommended profile, builds three deterministic sizing
-   combinations, and writes:
-   - `logs/morning_report_<date>.pdf` — the LaTeX report (original sizings, market
-     analysis, recommended profile, and three combinations: aggressive / balanced /
-     passive).
-   - `logs/discretionary_<date>.json` — the three profiles' sleeve + ticker weights.
-2. **You read the PDF and pick one profile.**
-3. **You trade it** — `python scripts/rebalance.py --profile <aggressive|balanced|passive>`
-   loads that profile's weights from the JSON and sends balancing orders (paper by
-   default). Risk guardrails still apply.
+   systematic targets and a **metrics panel** (VIX level + 252d percentile and
+   overlay status, 10Y yield + 5d change, TLT/IEF trend, breadth above SMA200,
+   holdings below SMA200, drawdown vs the -10% guardrail, implied turnover),
+   runs **Stage 1** (headless `claude` with web search, SOP in
+   `prompts/01_news_exec_summary.md`) for an executive summary + regime bias,
+   builds three **deterministic tilt options of today's sizings**
+   (`systematic` as-is; `risk_on` = A/B/CTA x1.5 funded from BIL ballast then
+   rates; `risk_off` = A/B/CTA x0.5 with proceeds to rates when bonds are in
+   uptrend, else BIL; caps: 45% per risk sleeve, 70% A+B, 35% per ticker;
+   risk_on is disabled when the VIX overlay is active), then runs **Stage 2**
+   (SOP in `prompts/02_options_analysis.md`) for a committee ranking,
+   recommendation, confidence and veto flag. Writes:
+   - `logs/morning_report_<date>.pdf` — metrics panel, exec summary, the three
+     option tables with deltas vs systematic, and the committee decision.
+   - `logs/discretionary_<date>.json` — full record (metrics, options, stages).
+2. **You read the PDF and pick one option.**
+3. **You trade it** — `python scripts/rebalance.py --option <systematic|risk_on|risk_off>`
+   loads that option's weights from the JSON and sends balancing orders (paper by
+   default). Risk guardrails still apply. `VETO: yes` in the report means trade
+   `systematic` regardless of the recommendation.
 
-The three profiles are fixed regime-gate sleeve allocations (each sums to 100%):
+The LLM never edits weights — it emits prose and control-line labels only; both
+stages degrade gracefully to the deterministic tables if the CLI call fails, and
+the SOPs can be retuned by editing the Markdown in `prompts/` (no code changes).
 
-| Profile    | A    | B    | rates | BIL ballast | cta  | tilt     |
-|------------|------|------|-------|-------------|------|----------|
-| aggressive | 30%  | 25%  | 10%   | 5%          | 30%  | risk-on  |
-| balanced   | 20%  | 20%  | 20%   | 20%         | 20%  | neutral  |
-| passive    | 10%  | 10%  | 30%   | 25%         | 25%  | risk-off |
-
-The LLM picks one of these; it never edits the numbers. If the LLM call fails, the
-report still ships the three deterministic tables with an "analysis unavailable"
-note. No `anthropic` SDK or extra API key is required — the headless CLI reuses
-your existing Claude Code auth.
-
-Self-check: `python -m live.discretionary`.
+Self-check: `python -m live.discretionary` and `python -m live.morning_metrics`.
 
 ## 9. Risk guardrails
 
