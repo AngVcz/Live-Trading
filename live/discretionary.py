@@ -266,6 +266,11 @@ def stage2_decide(run_date: date, stage1: Dict, options: Dict[str, Dict],
         prompt = _render_prompt("02_options_analysis.md",
                                 DATE=run_date.isoformat(),
                                 STAGE1_TEXT=stage1.get("exec_summary", "(unavailable)"),
+                                # _parse_stage1 strips these labels out of
+                                # exec_summary; pass them so the committee can see
+                                # the self-report (veto trigger: low confidence).
+                                STAGE1_BIAS=stage1.get("regime_bias") or "unavailable",
+                                STAGE1_CONF=stage1.get("summary_confidence") or "unavailable",
                                 OPTIONS_JSON=json.dumps(options, indent=2, default=str))
         parsed = _parse_stage2(_call_claude(prompt, model))
         parsed["source"] = "claude-cli"

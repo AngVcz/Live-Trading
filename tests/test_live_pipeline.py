@@ -335,10 +335,13 @@ def test_stage_degrades_on_missing_prompt(tmp_path, monkeypatch):
 
 
 def test_prompt_sop_headers_match_parsers():
+    import re
+
     from live.discretionary import _render_prompt
     t1 = _render_prompt("01_news_exec_summary.md", DATE="2026-01-01", METRICS_JSON="{}")
     t2 = _render_prompt("02_options_analysis.md", DATE="2026-01-01",
-                        STAGE1_TEXT="x", OPTIONS_JSON="{}")
+                        STAGE1_TEXT="x", OPTIONS_JSON="{}",
+                        STAGE1_BIAS="neutral", STAGE1_CONF="med")
     # Headers the parsers search for via _section() — straight apostrophe in
     # "Today's events" (the U+2019 variant has an explicit fallback).
     assert "## Headlines" in t1
@@ -348,3 +351,9 @@ def test_prompt_sop_headers_match_parsers():
     assert "## Assessment" in t2
     assert "## Option ranking" in t2
     assert "RECOMMENDED_OPTION:" in t2 and "CONFIDENCE:" in t2 and "VETO:" in t2
+    # Ranking-line format the parser regexes for: "N. <option> — <reason>".
+    assert "1. <systematic|risk_on|risk_off>" in t2
+    assert "— one-line reason" in t2
+    # Every token must be substituted at render time (stage2 also passes the
+    # stage-1 self-report labels, which _parse_stage1 strips from exec_summary).
+    assert not re.search(r"\{[A-Z_]+\}", t1 + t2), "unsubstituted token in rendered prompt"
