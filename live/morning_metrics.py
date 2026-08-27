@@ -58,9 +58,9 @@ def _tnx_metrics(as_of: date) -> Dict[str, Any]:
     if len(col) < 6:
         raise ValueError("short TNX history")
     return {
-        # ^TNX quotes the 10Y yield x 10 (CBOE convention).
-        "tnx_10y_level": round(float(col.iloc[-1]) / 10.0, 3),
-        "tnx_change_5d": round(float(col.iloc[-1] - col.iloc[-6]) / 10.0, 3),
+        # yfinance's ^TNX series quotes the 10Y yield directly (verified vs FRED DGS10 2026-08-26: ^TNX close 4.67 == DGS10 4.66); no scaling.
+        "tnx_10y_level": round(float(col.iloc[-1]), 3),
+        "tnx_change_5d": round(float(col.iloc[-1] - col.iloc[-6]), 3),
     }
 
 

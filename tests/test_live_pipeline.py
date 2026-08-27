@@ -242,6 +242,27 @@ def test_metrics_panel_degrades_to_na(monkeypatch):
     assert m["guardrail_margin_pct"] == 10.0
 
 
+def test_tnx_metrics_no_scaling(monkeypatch):
+    # yfinance's ^TNX series already quotes the 10Y yield directly (verified vs
+    # FRED DGS10 2026-08-26: ^TNX close 4.67 == DGS10 4.66) -- the raw values
+    # must pass through UNSCALED. The old /10 (CBOE index convention) reported
+    # 0.467 for a 4.67% yield.
+    import live.data_feed as data_feed
+    import live.morning_metrics as mm
+
+    idx = pd.bdate_range(end=date(2025, 6, 30), periods=10)
+    # iloc[-1] = 4.67 (last close); iloc[-6] = 4.69 (5 trading days earlier).
+    values = [4.70, 4.71, 4.72, 4.68, 4.69, 4.71, 4.70, 4.68, 4.66, 4.67]
+
+    def _fake_fetch(tickers, start, end, prefer_alpaca=True):
+        return pd.DataFrame({"^TNX": pd.Series(values, index=idx, dtype=float)})
+
+    monkeypatch.setattr(data_feed, "fetch_panel", _fake_fetch)
+    m = mm._tnx_metrics(date(2025, 6, 30))
+    assert m["tnx_10y_level"] == 4.67
+    assert m["tnx_change_5d"] == -0.02
+
+
 def test_stage_parsers():
     from live.discretionary import _parse_stage1, _parse_stage2
     s1 = _parse_stage1(
