@@ -148,11 +148,18 @@ def _save_run_log(
     orders: list,
     account: Dict[str, float],
     dry_run: bool,
+    option: Optional[str] = None,
+    veto: Optional[str] = None,
 ) -> None:
     record = {
         "date": run_date.isoformat(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "dry_run": dry_run,
+        # Effective option traded + the report's veto flag (None on the
+        # systematic/--weights paths) so a log-skim cannot misread a
+        # veto-overridden run as the requested option.
+        "option": option,
+        "veto": veto,
         "target_weights": target_weights,
         "orders": [
             {
@@ -171,8 +178,12 @@ def _save_run_log(
         f.write(json.dumps(record) + "\n")
 
 
-def _load_option(run_date: date, option: str) -> Tuple[Dict[str, float], pd.Series]:
-    """Read the chosen option's ticker + sleeve weights from the morning report JSON."""
+def _load_option(run_date: date, option: str) -> Tuple[str, str, Dict[str, float], pd.Series]:
+    """Read the chosen option's ticker + sleeve weights from the morning report JSON.
+
+    Returns ``(effective_option, veto, tickers, sleeve)``. ``effective_option``
+    is forced to ``systematic`` when the report carries an active veto.
+    """
     path = LOG_DIR / f"discretionary_{run_date.isoformat()}.json"
     if not path.exists():
         raise FileNotFoundError(
@@ -181,11 +192,12 @@ def _load_option(run_date: date, option: str) -> Tuple[Dict[str, float], pd.Seri
         )
     with path.open(encoding="utf-8") as f:
         data = json.load(f)
-    if data.get("stage2", {}).get("veto") == "yes" and option != "systematic":
+    veto = data.get("stage2", {}).get("veto", "")
+    if veto == "yes" and option != "systematic":
         print(f"VETO ACTIVE in report: overriding --option {option} -> systematic")
         option = "systematic"
     o = data["options"][option]
-    return o["tickers"], pd.Series(o["sleeve"], dtype=float)
+    return option, veto, o["tickers"], pd.Series(o["sleeve"], dtype=float)
 
 
 # --- Drift gate (ticker-level) ----------------------------------------------
@@ -233,6 +245,8 @@ def decide_and_execute(
     account: Dict[str, float],
     drift_threshold: float,
     dry_run: bool,
+    option: Optional[str] = None,
+    veto: Optional[str] = None,
 ) -> Tuple[List, bool, bool]:
     """Apply the ticker-level drift gate; execute via ``executor.rebalance`` unless skipping.
 
@@ -299,7 +313,8 @@ def decide_and_execute(
 
     # Run-log always (audit, tagged dry_run). last_weights only on a clean, real run:
     # order errors (#1) and dry-runs (#7) must not mutate production state.
-    _save_run_log(run_date, target_tickers, orders, account, dry_run)
+    _save_run_log(run_date, target_tickers, orders, account, dry_run,
+                  option=option, veto=veto)
     if not dry_run and not had_error:
         save_last_weights(target_tickers, run_date)
     return orders, skipped, had_error
@@ -326,6 +341,8 @@ def main() -> int:
         return 1
     prices = sys_targets["prices"]
 
+    effective_option: Optional[str] = None
+    veto_flag: Optional[str] = None
     if args.weights:
         try:
             target_tickers = {k: float(v) for k, v in json.loads(args.weights).items()}
@@ -339,12 +356,17 @@ def main() -> int:
         print(f"Using custom --weights override ({len(target_tickers)} tickers).")
     elif args.option:
         try:
-            target_tickers, sleeve_weights = _load_option(run_date, args.option)
+            effective_option, veto_flag, target_tickers, sleeve_weights = _load_option(
+                run_date, args.option)
         except Exception as e:
             print(f"FATAL: could not load option '{args.option}': {e}")
             return 1
-        print(f"Using discretionary option '{args.option}' "
-              f"({len(target_tickers)} tickers).")
+        # Print the EFFECTIVE option: after a veto override the weights are
+        # systematic's, not the requested option's.
+        override = (f" (veto override from {args.option})"
+                    if effective_option != args.option else "")
+        print(f"Using discretionary option '{effective_option}' "
+              f"({len(target_tickers)} tickers){override}.")
     else:
         target_tickers = sys_targets["ticker_weights"]
         sleeve_weights = sys_targets["sleeve_weights"]
@@ -400,6 +422,8 @@ def main() -> int:
             account=account,
             drift_threshold=args.drift_threshold,
             dry_run=args.dry_run,
+            option=effective_option,
+            veto=veto_flag,
         )
     except Exception as e:
         print(f"FATAL: execution failed: {e}")

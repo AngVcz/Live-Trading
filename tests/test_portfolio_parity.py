@@ -74,8 +74,7 @@ def test_empty_sleeve_to_bil():
 # budget to BIL. Regression: the bear->BIL_ballast reconciliation renamed the sleeve
 # keys but decompose still hardcoded .loc['bear'], so morning_report.py crashed
 # building the first option table (uncaught: self-check + pytest never decompose).
-# (Built here as a literal, mirroring apply_profile("balanced") — the fixed
-# PROFILES vectors were deleted in Task 6 and superseded by the tilt engine.)
+# (Built here as a literal sleeve with the tilt engine's exact key order.)
 def test_decompose_accepts_option_form_bil_ballast_no_bear_key():
     from live.portfolio import decompose_target_to_tickers
 
@@ -91,7 +90,7 @@ def test_decompose_accepts_option_form_bil_ballast_no_bear_key():
 
     # No KeyError; sums to 1.0; flat prices floor every sleeve to BIL, so the
     # 20% BIL_ballast is part of an all-BIL book (BIL == 1.0). SH is never
-    # deployed because the profile form carries no bear budget.
+    # deployed because the option form carries no bear budget.
     assert abs(sum(out.values()) - 1.0) < 1e-9
     assert abs(out["BIL"] - 1.0) < 1e-9
     assert out.get("SH", 0.0) < 1e-9

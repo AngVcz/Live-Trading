@@ -418,7 +418,8 @@ def test_build_report_tex_hostile_input(tmp_path, monkeypatch):
 
 def test_load_option_veto_override(tmp_path, monkeypatch, capsys):
     # Money path: _load_option's veto backstop must swap a vetoed non-systematic
-    # option for the report's systematic option BEFORE any weights are loaded.
+    # option for the report's systematic option BEFORE any weights are loaded,
+    # and report back the EFFECTIVE option name (so main() can print it).
     # LOG_DIR is a module global read inside _load_option -- patch where USED.
     import scripts.rebalance as rb
 
@@ -435,7 +436,8 @@ def test_load_option_veto_override(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(rb, "LOG_DIR", tmp_path)
 
     # veto=yes + non-systematic requested -> the report's SYSTEMATIC is loaded.
-    tickers, sleeve = rb._load_option(date(2025, 6, 30), "risk_off")
+    effective, veto, tickers, sleeve = rb._load_option(date(2025, 6, 30), "risk_off")
+    assert effective == "systematic" and veto == "yes"
     assert tickers == {"BIL": 1.0}
     assert sleeve.to_dict() == {"BIL_ballast": 1.0}
     assert "VETO ACTIVE" in capsys.readouterr().out
@@ -443,7 +445,8 @@ def test_load_option_veto_override(tmp_path, monkeypatch, capsys):
     # veto=no: the requested option is returned unchanged.
     payload["stage2"]["veto"] = "no"
     path.write_text(json.dumps(payload), encoding="utf-8")
-    tickers, sleeve = rb._load_option(date(2025, 6, 30), "risk_off")
+    effective, veto, tickers, sleeve = rb._load_option(date(2025, 6, 30), "risk_off")
+    assert effective == "risk_off" and veto == "no"
     assert tickers == {"SPY": 0.5, "BIL": 0.5}
     assert sleeve.to_dict() == {"A": 0.5, "BIL_ballast": 0.5}
     assert "VETO ACTIVE" not in capsys.readouterr().out
@@ -452,3 +455,26 @@ def test_load_option_veto_override(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(rb, "LOG_DIR", tmp_path / "nope")
     with pytest.raises(FileNotFoundError):
         rb._load_option(date(2025, 6, 30), "risk_off")
+
+
+def test_run_log_records_option_and_veto(tmp_path, monkeypatch):
+    # The run-log record must carry the effective option + the report's veto flag
+    # so a later log-skim cannot misread a veto-overridden run as the traded option.
+    import scripts.rebalance as rb
+
+    monkeypatch.setattr(rb, "WEIGHT_LOG", tmp_path / "weights.jsonl")
+
+    def _last_record():
+        lines = (tmp_path / "weights.jsonl").read_text(encoding="utf-8").splitlines()
+        return json.loads(lines[-1])
+
+    # Option path: effective name + the report's veto flag are stored verbatim.
+    rb._save_run_log(date(2025, 6, 30), {"BIL": 1.0}, [], {"equity": 1.0},
+                     dry_run=True, option="systematic", veto="yes")
+    rec = _last_record()
+    assert rec["option"] == "systematic" and rec["veto"] == "yes"
+
+    # Systematic / --weights path: no option traded -> both fields are None.
+    rb._save_run_log(date(2025, 6, 30), {"SPY": 1.0}, [], {"equity": 1.0}, dry_run=True)
+    rec = _last_record()
+    assert rec["option"] is None and rec["veto"] is None
