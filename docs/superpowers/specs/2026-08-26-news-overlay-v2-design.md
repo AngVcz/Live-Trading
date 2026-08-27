@@ -102,7 +102,8 @@ options, each `{"sleeve": {...}, "tickers": {...}}`.
 Post-tilt bounds, always enforced (repair by scaling tilted sleeves back toward `s`,
 then renormalize to sum 1.0):
 
-1. each sleeve ≤ 0.45
+1. each **risk** sleeve (A, B, rates, cta) ≤ 0.45; `BIL_ballast` is the residual
+   cash sink and is uncapped
 2. `A + B` ≤ 0.70
 3. after ticker decomposition: any single ticker > 0.35 is clipped, spill to `BIL`
    (leaves margin below the 0.50 NAV guardrail in `risk.py`)
