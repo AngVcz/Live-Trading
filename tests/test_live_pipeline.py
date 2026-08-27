@@ -332,3 +332,19 @@ def test_stage_degrades_on_missing_prompt(tmp_path, monkeypatch):
     s2 = dd.stage2_decide(date(2025, 6, 30), {"exec_summary": "x"},
                           {"systematic": {"sleeve": {}, "tickers": {}, "note": ""}})
     assert s2["source"] == "none"
+
+
+def test_prompt_sop_headers_match_parsers():
+    from live.discretionary import _render_prompt
+    t1 = _render_prompt("01_news_exec_summary.md", DATE="2026-01-01", METRICS_JSON="{}")
+    t2 = _render_prompt("02_options_analysis.md", DATE="2026-01-01",
+                        STAGE1_TEXT="x", OPTIONS_JSON="{}")
+    # Headers the parsers search for via _section() — straight apostrophe in
+    # "Today's events" (the U+2019 variant has an explicit fallback).
+    assert "## Headlines" in t1
+    assert "## Today's events" in t1
+    # Control lines the parsers regex for.
+    assert "REGIME_BIAS:" in t1 and "SUMMARY_CONFIDENCE:" in t1
+    assert "## Assessment" in t2
+    assert "## Option ranking" in t2
+    assert "RECOMMENDED_OPTION:" in t2 and "CONFIDENCE:" in t2 and "VETO:" in t2
