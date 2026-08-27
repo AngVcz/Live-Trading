@@ -103,3 +103,40 @@ def test_executor_dry_run():
     results = executor.rebalance(target, prices, dry_run=True)
     spies = [r for r in results if r.ticker == "SPY"]
     assert spies and spies[0].qty == pytest.approx(10.0, 0.01)
+
+
+def test_tilt_options_bounds():
+    from live.core_signals import build_core_returns
+    from live.portfolio import SleeveConfig, build_live_weights, build_sleeve_returns
+    from live.discretionary import build_tilt_options, OPTION_NAMES
+    prices = _load_prices().rename(columns={"^VIX": "VIX"})
+    ret_a, ret_b, weights_a, weights_b = build_core_returns(prices, commission_bps=10.0)
+    sleeve = build_live_weights(ret_a, ret_b, build_sleeve_returns(prices), SleeveConfig())
+    options = build_tilt_options(sleeve, weights_a.iloc[-1], weights_b.iloc[-1], prices)
+    assert set(options) == set(OPTION_NAMES)
+    ab = {}
+    for name in OPTION_NAMES:
+        o = options[name]
+        assert abs(sum(o["tickers"].values()) - 1.0) < 1e-6
+        assert all(w >= -1e-9 for w in o["tickers"].values())
+        assert all(w <= 0.35 + 1e-9 for t, w in o["tickers"].items() if t != "BIL")
+        for k in ("A", "B", "rates", "cta"):
+            assert o["sleeve"][k] <= 0.45 + 1e-9, (name, k)
+        ab[name] = o["sleeve"]["A"] + o["sleeve"]["B"]
+    assert ab["risk_off"] < ab["systematic"] < ab["risk_on"]
+    assert ab["risk_on"] <= 0.70 + 1e-9
+
+
+def test_tilt_options_vix_overlay_disables_risk_on():
+    from live.core_signals import build_core_returns
+    from live.portfolio import SleeveConfig, build_live_weights, build_sleeve_returns
+    from live.discretionary import build_tilt_options
+    prices = _load_prices().rename(columns={"^VIX": "VIX"})
+    ret_a, ret_b, weights_a, weights_b = build_core_returns(prices, commission_bps=10.0)
+    sleeve = build_live_weights(ret_a, ret_b, build_sleeve_returns(prices), SleeveConfig())
+    options = build_tilt_options(sleeve, weights_a.iloc[-1], weights_b.iloc[-1],
+                                 prices, vix_overlay_active=True)
+    diff = sum(abs(options["risk_on"]["sleeve"][k] - options["systematic"]["sleeve"][k])
+               for k in options["systematic"]["sleeve"])
+    assert diff < 1e-12
+    assert "disabled" in options["risk_on"]["note"]

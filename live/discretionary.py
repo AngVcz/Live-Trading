@@ -23,6 +23,128 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = REPO_ROOT / "logs"
 
+PROMPTS_DIR = REPO_ROOT / "prompts"
+SLEEVE_ORDER = ["A", "B", "rates", "BIL_ballast", "cta"]
+_SLEEVE_ORDER = SLEEVE_ORDER  # alias; removed in Task 6 with apply_profile
+OPTION_NAMES = ("systematic", "risk_on", "risk_off")
+_RISK_SLEEVES = ("A", "B", "rates", "cta")   # BIL_ballast is the cash sink, uncapped
+SLEEVE_CAP = 0.45
+AB_CAP = 0.70
+TICKER_CAP = 0.35                          # margin below the 0.50 risk-guardrail line
+_RISK_ON_MULT = {"A": 1.5, "B": 1.5, "cta": 1.5}
+_RISK_OFF_MULT = {"A": 0.5, "B": 0.5, "cta": 0.5}
+
+
+def _base_sleeve(sleeve: pd.Series) -> pd.Series:
+    """Reindex to the five live sleeves ('bear' is 0 by default) as floats."""
+    return sleeve.reindex(SLEEVE_ORDER).fillna(0.0).astype(float)
+
+
+def _join_note(*parts: str) -> str:
+    return "; ".join(p for p in parts if p)
+
+
+def _enforce_caps(s: pd.Series) -> tuple[pd.Series, str]:
+    """Repair cap breaches by spilling the excess into BIL_ballast."""
+    s = s.copy()
+    notes = []
+    ab = s["A"] + s["B"]
+    if ab > AB_CAP:
+        f = AB_CAP / ab
+        s["BIL_ballast"] += (s["A"] - s["A"] * f) + (s["B"] - s["B"] * f)
+        s["A"] *= f
+        s["B"] *= f
+        notes.append("A+B capped at 70%")
+    for k in _RISK_SLEEVES:
+        if s[k] > SLEEVE_CAP:
+            s["BIL_ballast"] += s[k] - SLEEVE_CAP
+            s[k] = SLEEVE_CAP
+            notes.append(f"{k} capped at 45%")
+    return s, _join_note(*notes)
+
+
+def _tilt_risk_on(s: pd.Series) -> tuple[pd.Series, str]:
+    out = s.copy()
+    for k, m in _RISK_ON_MULT.items():
+        out[k] = s[k] * m
+    extra = float(sum(out[k] - s[k] for k in _RISK_ON_MULT))
+    for src in ("BIL_ballast", "rates"):  # fund from cash first, then rates
+        take = min(out[src], extra)
+        out[src] -= take
+        extra -= take
+    if extra > 1e-9:
+        return s.copy(), "risk-on tilt unfundable; systematic kept"
+    return out, ""
+
+
+def _tilt_risk_off(s: pd.Series, rates_in_uptrend: bool) -> tuple[pd.Series, str]:
+    out = s.copy()
+    for k, m in _RISK_OFF_MULT.items():
+        out[k] = s[k] * m
+    freed = float(sum(s[k] - out[k] for k in _RISK_OFF_MULT))
+    if rates_in_uptrend:
+        to_rates = min(freed, max(0.0, SLEEVE_CAP - out["rates"]))
+        out["rates"] += to_rates
+        freed -= to_rates
+    out["BIL_ballast"] += freed
+    return out, ""
+
+
+def _clip_tickers(tickers: Dict[str, float]) -> Dict[str, float]:
+    out = dict(tickers)
+    for t, w in list(out.items()):
+        if t != "BIL" and w > TICKER_CAP:
+            out[t] = TICKER_CAP
+            out["BIL"] = out.get("BIL", 0.0) + (w - TICKER_CAP)
+    return out
+
+
+def _rates_in_uptrend(prices: pd.DataFrame) -> bool:
+    """True when TLT or IEF closed above its 200-day SMA on the last bar."""
+    for t in ("TLT", "IEF"):
+        if t in prices.columns:
+            col = prices[t].dropna()
+            if len(col) >= 200 and col.iloc[-1] > col.tail(200).mean():
+                return True
+    return False
+
+
+def build_tilt_options(
+    sleeve_weights: pd.Series,
+    weights_a: pd.Series,
+    weights_b: pd.Series,
+    prices: pd.DataFrame,
+    vix_overlay_active: bool = False,
+) -> Dict[str, Dict]:
+    """Build the three report options by tilting TODAY's systematic sizings.
+
+    Pure and deterministic: no fetch, no LLM. Each option is
+    {"sleeve": {...}, "tickers": {...}, "note": str} with weights summing to 1.0.
+    """
+    from live.portfolio import decompose_target_to_tickers
+
+    base = _base_sleeve(sleeve_weights)
+    variants = {
+        "systematic": (base.copy(), ""),
+        "risk_on": _tilt_risk_on(base),
+        "risk_off": _tilt_risk_off(base, _rates_in_uptrend(prices)),
+    }
+    options: Dict[str, Dict] = {}
+    for name in OPTION_NAMES:
+        sv, note = variants[name]
+        if name == "risk_on" and vix_overlay_active:
+            sv, note = base.copy(), "risk-on tilt disabled by active VIX overlay"
+        sv, cap_note = _enforce_caps(sv)
+        total = float(sv.sum())
+        if total > 0:
+            sv = sv / total
+        tickers = _clip_tickers(decompose_target_to_tickers(sv, weights_a, weights_b, prices))
+        options[name] = {"sleeve": {k: float(v) for k, v in sv.items()},
+                         "tickers": tickers,
+                         "note": _join_note(note, cap_note)}
+    return options
+
+
 # Fixed regime-gate sleeve allocations. Each sums to 1.0. The LLM picks one; it
 # never edits these numbers.
 PROFILES: Dict[str, Dict[str, float]] = {
@@ -31,7 +153,6 @@ PROFILES: Dict[str, Dict[str, float]] = {
     "passive": {"A": 0.10, "B": 0.10, "rates": 0.30, "BIL_ballast": 0.25, "cta": 0.25},
 }
 
-_SLEEVE_ORDER = ["A", "B", "rates", "BIL_ballast", "cta"]
 _MIKTEX_BIN = Path(r"C:\Users\angve\AppData\Local\Programs\MiKTeX\miktex\bin\x64")
 
 
@@ -79,11 +200,12 @@ def _parse_analysis(text: str) -> Dict:
     }
 
 
-def analyze(run_date: date) -> Dict:
+def analyze(run_date: date, model: str | None = None) -> Dict:
     """Call the headless ``claude`` CLI for market analysis + a recommended profile.
 
     Reuses the user's existing Claude Code auth (no extra key). On any failure the
-    report still ships deterministic tables with ``source == "none"``.
+    report still ships deterministic tables with ``source == "none"``. Pass
+    ``model`` (e.g. ``"claude-fable-5"``) to override the CLI's default model.
     """
     prompt = (
         "You are a macro/market analyst for a dual-momentum ETF portfolio with five "
@@ -106,8 +228,11 @@ def analyze(run_date: date) -> Dict:
         "Do not add anything after those two lines."
     )
     try:
+        cmd = ["claude", "-p", prompt, "--output-format", "json", "--allowedTools", "WebSearch"]
+        if model:
+            cmd += ["--model", model]
         proc = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "json", "--allowedTools", "WebSearch"],
+            cmd,
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
         )
         if proc.returncode != 0:
