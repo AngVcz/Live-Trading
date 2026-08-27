@@ -144,10 +144,10 @@ def test_tilt_options_vix_overlay_disables_risk_on():
 
 def test_tilt_edges_unfundable_and_caps():
     from live.discretionary import _tilt_risk_on, _tilt_risk_off, _enforce_caps, _clip_tickers
-    # (a) unfundable risk-on -> identity + note
+    # (a) unfundable risk-on -> identity + note (note text is user-visible: pin it)
     s = pd.Series({"A": 0.3, "B": 0.3, "rates": 0.05, "BIL_ballast": 0.05, "cta": 0.30})
     out, note = _tilt_risk_on(s)
-    assert out.equals(s) and "unfundable" in note
+    assert out.equals(s) and note == "risk-on tilt unfundable; systematic kept"
     # (b) cap repair preserves the sum and notes both repairs
     s2 = pd.Series({"A": 0.60, "B": 0.20, "rates": 0.10, "BIL_ballast": 0.05, "cta": 0.05})
     out2, note2 = _enforce_caps(s2)
@@ -165,6 +165,19 @@ def test_tilt_edges_unfundable_and_caps():
     # (d) ticker clip spills to BIL
     clipped = _clip_tickers({"SPY": 0.60, "BIL": 0.40})
     assert abs(clipped["SPY"] - 0.35) < 1e-12 and abs(clipped["BIL"] - 0.65) < 1e-12
+
+
+def test_tilt_rejects_funded_bear_sleeve():
+    from live.core_signals import build_core_returns
+    from live.discretionary import build_tilt_options
+    prices = _load_prices().rename(columns={"^VIX": "VIX"})
+    _, _, weights_a, weights_b = build_core_returns(prices, commission_bps=10.0)
+    # A funded 'bear' sleeve must be rejected outright, not silently zeroed by the
+    # reindex -- and the guard must be a real exception (it survives `python -O`).
+    funded = pd.Series({"A": 0.2, "B": 0.2, "rates": 0.2, "BIL_ballast": 0.2,
+                        "cta": 0.2, "bear": 0.2})
+    with pytest.raises(ValueError):
+        build_tilt_options(funded, weights_a.iloc[-1], weights_b.iloc[-1], prices)
 
 
 def test_metrics_panel_smoke():
@@ -225,3 +238,33 @@ def test_metrics_panel_degrades_to_na(monkeypatch):
     assert m["peak_equity"] == 100_000.0
     assert m["drawdown_pct"] == 0.0
     assert m["guardrail_margin_pct"] == 10.0
+
+
+def test_stage_parsers():
+    from live.discretionary import _parse_stage1, _parse_stage2
+    s1 = _parse_stage1(
+        "- Fed held rates steady.\n- CPI cooled to 2.9% y/y.\n\n"
+        "## Macro regime\nDisinflation continues; breadth improving.\n\n"
+        "## Today's events\n- 14:30 ET: FOMC minutes.\n\n"
+        "## Metrics read\nVIX percentile near mid-range.\n\n"
+        "REGIME_BIAS: neutral\nSUMMARY_CONFIDENCE: med\n")
+    assert s1["regime_bias"] == "neutral"
+    assert s1["summary_confidence"] == "med"
+    assert "FOMC" in " ".join(s1["macro_calendar"])
+    assert "REGIME_BIAS" not in s1["exec_summary"]
+    bad1 = _parse_stage1("text\nREGIME_BIAS: euphoric\nSUMMARY_CONFIDENCE: max\n")
+    assert bad1["regime_bias"] == "" and bad1["summary_confidence"] == ""
+
+    s2 = _parse_stage2(
+        "## Assessment\nBreadth supports risk, but the FOMC is a two-way event.\n\n"
+        "## Option ranking\n1. systematic — event day, stand pat.\n"
+        "2. risk_off — cheap insurance.\n3. risk_on — premature.\n\n"
+        "RECOMMENDED_OPTION: systematic\nCONFIDENCE: med\nVETO: no\n")
+    assert s2["recommended_option"] == "systematic"
+    assert s2["confidence"] == "med" and s2["veto"] == "no"
+    # Ranking entries carry the one-line reason (Task 5's build_report renders it).
+    assert s2["ranking"][0] == {"rank": 1, "option": "systematic",
+                                "reason": "event day, stand pat."}
+    assert "RECOMMENDED_OPTION" not in s2["assessment"]
+    bad2 = _parse_stage2("text\nRECOMMENDED_OPTION: yolo\nCONFIDENCE: med\nVETO: maybe\n")
+    assert bad2["recommended_option"] == "" and bad2["veto"] == ""

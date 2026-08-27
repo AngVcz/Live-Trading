@@ -37,7 +37,9 @@ _RISK_OFF_MULT = {"A": 0.5, "B": 0.5, "cta": 0.5}
 
 def _base_sleeve(sleeve: pd.Series) -> pd.Series:
     """Reindex to the five live sleeves ('bear' is 0 by default) as floats."""
-    assert abs(float(sleeve.get("bear", 0.0))) < 1e-9, "tilt engine assumes the bear sleeve is disabled"
+    if abs(float(sleeve.get("bear", 0.0))) >= 1e-9:
+        # Not a bare assert: this guards traded weights and must survive `python -O`.
+        raise ValueError("tilt engine assumes the bear sleeve is disabled")
     return sleeve.reindex(SLEEVE_ORDER).fillna(0.0).astype(float)
 
 
@@ -145,6 +147,128 @@ def build_tilt_options(
                          "tickers": tickers,
                          "note": _join_note(note, cap_note)}
     return options
+
+
+# ---- LLM stage plumbing -----------------------------------------------------
+
+_REGIME_BIAS = ("risk_on", "neutral", "risk_off")
+_CONF = ("low", "med", "high")
+
+
+def _call_claude(prompt: str, model: str | None = None) -> str:
+    """One headless ``claude`` CLI call; returns result text or raises RuntimeError."""
+    cmd = ["claude", "-p", prompt, "--output-format", "json", "--allowedTools", "WebSearch"]
+    if model:
+        cmd += ["--model", model]
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude exit {proc.returncode}")
+    env = json.loads(proc.stdout)
+    if env.get("is_error") or env.get("subtype") != "success":
+        raise RuntimeError(env.get("result") or "claude error")
+    return env.get("result", "")
+
+
+def _control_line(text: str, key: str, allowed: tuple[str, ...]) -> str:
+    m = re.search(rf"(?im)^\s*{key}:\s*([a-zA-Z_]+)\s*$", text)
+    if not m:
+        return ""
+    val = m.group(1).strip().lower()
+    return val if val in allowed else ""
+
+
+def _strip_control_lines(text: str, keys: tuple[str, ...]) -> str:
+    body = text
+    for k in keys:
+        body = re.sub(rf"(?im)^\s*{k}:.*$\n?", "", body)
+    return body.strip()
+
+
+def _section(text: str, header: str) -> str:
+    """Return the text under a '## <header>' line, up to the next '## ' or EOF."""
+    m = re.search(rf"(?ims)^##\s+{re.escape(header)}\s*$\n?(.*?)(?=^##\s|\Z)", text)
+    return m.group(1).strip() if m else ""
+
+
+def _parse_stage1(text: str) -> Dict:
+    return {
+        "exec_summary": _strip_control_lines(text, ("REGIME_BIAS", "SUMMARY_CONFIDENCE")),
+        "headlines": re.findall(r"(?m)^\s*[-*•]\s+(.+?)\s*$",
+                                _section(text, "Headlines"))[:5],
+        "macro_calendar": re.findall(r"(?m)^\s*[-*•]\s+(.+?)\s*$",
+                                     _section(text, "Today's events")),
+        "regime_bias": _control_line(text, "REGIME_BIAS", _REGIME_BIAS),
+        "summary_confidence": _control_line(text, "SUMMARY_CONFIDENCE", _CONF),
+    }
+
+
+def _parse_stage2(text: str) -> Dict:
+    ranking = []
+    for m in re.finditer(r"(?m)^\s*([123])[\.)]\s*(\w+)\s*[—–-]\s*(.+?)\s*$",
+                         _section(text, "Option ranking")):
+        opt = m.group(2).strip().lower()
+        ranking.append({"rank": int(m.group(1)),
+                        "option": opt if opt in OPTION_NAMES else "",
+                        "reason": m.group(3).strip()})
+    return {
+        "assessment": _strip_control_lines(
+            text, ("RECOMMENDED_OPTION", "CONFIDENCE", "VETO")),
+        "ranking": ranking,
+        "recommended_option": _control_line(text, "RECOMMENDED_OPTION", OPTION_NAMES),
+        "confidence": _control_line(text, "CONFIDENCE", _CONF),
+        "veto": _control_line(text, "VETO", ("yes", "no")),
+    }
+
+
+def _render_prompt(template_name: str, **tokens: str) -> str:
+    """Read prompts/<template_name> and substitute ALL-CAPS tokens (no .format:
+    the SOPs may contain literal braces in JSON examples)."""
+    t = (PROMPTS_DIR / template_name).read_text(encoding="utf-8")
+    for k, v in tokens.items():
+        t = t.replace("{" + k + "}", v)
+    return t
+
+
+def _no_stage1(reason: str) -> Dict:
+    return {"exec_summary": f"(Executive summary unavailable: {reason}.)",
+            "headlines": [], "macro_calendar": [], "regime_bias": "",
+            "summary_confidence": "", "source": "none"}
+
+
+def _no_stage2(reason: str) -> Dict:
+    return {"assessment": f"(Committee analysis unavailable: {reason}. "
+                          "Options tables above are still valid.)",
+            "ranking": [], "recommended_option": "", "confidence": "",
+            "veto": "", "source": "none"}
+
+
+def stage1_summarize(run_date: date, metrics: Dict, model: str | None = None) -> Dict:
+    """Stage 1: news scrape + executive summary per prompts/01_news_exec_summary.md."""
+    prompt = _render_prompt("01_news_exec_summary.md",
+                            DATE=run_date.isoformat(),
+                            METRICS_JSON=json.dumps(metrics, indent=2, default=str))
+    try:
+        parsed = _parse_stage1(_call_claude(prompt, model))
+        parsed["source"] = "claude-cli"
+        return parsed
+    except Exception as e:  # ponytail: any failure -> deterministic-only report
+        return _no_stage1(str(e))
+
+
+def stage2_decide(run_date: date, stage1: Dict, options: Dict[str, Dict],
+                  model: str | None = None) -> Dict:
+    """Stage 2: committee ranking of the three options per prompts/02_options_analysis.md."""
+    prompt = _render_prompt("02_options_analysis.md",
+                            DATE=run_date.isoformat(),
+                            STAGE1_TEXT=stage1.get("exec_summary", "(unavailable)"),
+                            OPTIONS_JSON=json.dumps(options, indent=2, default=str))
+    try:
+        parsed = _parse_stage2(_call_claude(prompt, model))
+        parsed["source"] = "claude-cli"
+        return parsed
+    except Exception as e:
+        return _no_stage2(str(e))
 
 
 # Fixed regime-gate sleeve allocations. Each sums to 1.0. The LLM picks one; it
