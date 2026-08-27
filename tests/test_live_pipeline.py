@@ -254,6 +254,9 @@ def test_stage_parsers():
     assert "REGIME_BIAS" not in s1["exec_summary"]
     bad1 = _parse_stage1("text\nREGIME_BIAS: euphoric\nSUMMARY_CONFIDENCE: max\n")
     assert bad1["regime_bias"] == "" and bad1["summary_confidence"] == ""
+    # Models sometimes emit the typographic apostrophe (U+2019) in this header.
+    s1b = _parse_stage1("## Today’s events\n- 13:00 ET: Fed speaker.\n")
+    assert s1b["macro_calendar"] == ["13:00 ET: Fed speaker."]
 
     s2 = _parse_stage2(
         "## Assessment\nBreadth supports risk, but the FOMC is a two-way event.\n\n"
@@ -268,3 +271,64 @@ def test_stage_parsers():
     assert "RECOMMENDED_OPTION" not in s2["assessment"]
     bad2 = _parse_stage2("text\nRECOMMENDED_OPTION: yolo\nCONFIDENCE: med\nVETO: maybe\n")
     assert bad2["recommended_option"] == "" and bad2["veto"] == ""
+    # Parser contracts: unknown option names blank out (reason kept); a
+    # bold-markdown rank line is ignored entirely.
+    weird = _parse_stage2(
+        "## Option ranking\n1. systematic — base.\n"
+        "2. risk-off — cheap insurance.\n"
+        "RECOMMENDED_OPTION: systematic\nCONFIDENCE: med\nVETO: no\n")
+    assert weird["ranking"][1]["option"] == "" and weird["ranking"][1]["reason"]
+    bold = _parse_stage2(
+        "## Option ranking\n**1. systematic — bold markdown.\n"
+        "RECOMMENDED_OPTION: systematic\nCONFIDENCE: med\nVETO: no\n")
+    assert bold["ranking"] == []
+
+
+def test_stage1_degrades_on_cli_failure(tmp_path, monkeypatch):
+    import live.discretionary as dd
+    # Stub prompt so the render succeeds and the failure comes from the CLI itself
+    # (prompts/ does not exist in the repo until Task 4; the stub keeps this hermetic).
+    (tmp_path / "01_news_exec_summary.md").write_text(
+        "Stage 1 for {DATE}\n{METRICS_JSON}\n", encoding="utf-8")
+    monkeypatch.setattr(dd, "PROMPTS_DIR", tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dd, "_call_claude", _boom)
+    out = dd.stage1_summarize(date(2025, 6, 30), {"vix_close": 16.0})
+    assert out["source"] == "none"
+    assert "boom" in out["exec_summary"]
+    assert out["macro_calendar"] == []
+    assert out["regime_bias"] == ""
+
+
+def test_stage2_degrades_on_cli_failure(tmp_path, monkeypatch):
+    import live.discretionary as dd
+    (tmp_path / "02_options_analysis.md").write_text(
+        "Stage 2 for {DATE}\n{STAGE1_TEXT}\n{OPTIONS_JSON}\n", encoding="utf-8")
+    monkeypatch.setattr(dd, "PROMPTS_DIR", tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dd, "_call_claude", _boom)
+    stage1 = {"exec_summary": "summary text"}
+    options = {name: {"sleeve": {}, "tickers": {}, "note": ""}
+               for name in ("systematic", "risk_on", "risk_off")}
+    out = dd.stage2_decide(date(2025, 6, 30), stage1, options)
+    assert out["source"] == "none"
+    assert "boom" in out["assessment"]
+
+
+def test_stage_degrades_on_missing_prompt(tmp_path, monkeypatch):
+    # prompts/ missing entirely: both stages must degrade to source=="none",
+    # never raise (regression test for render-inside-try).
+    import live.discretionary as dd
+    monkeypatch.setattr(dd, "PROMPTS_DIR", tmp_path)  # empty temp dir
+    out = dd.stage1_summarize(date(2025, 6, 30), {"vix_close": 16.0})
+    assert out["source"] == "none"
+    assert out["macro_calendar"] == [] and out["regime_bias"] == ""
+    s2 = dd.stage2_decide(date(2025, 6, 30), {"exec_summary": "x"},
+                          {"systematic": {"sleeve": {}, "tickers": {}, "note": ""}})
+    assert s2["source"] == "none"

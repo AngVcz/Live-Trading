@@ -163,7 +163,7 @@ def _call_claude(prompt: str, model: str | None = None) -> str:
     proc = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     if proc.returncode != 0:
-        raise RuntimeError(f"claude exit {proc.returncode}")
+        raise RuntimeError(f"claude exit {proc.returncode}: {(proc.stderr or '').strip()[:200]}")
     env = json.loads(proc.stdout)
     if env.get("is_error") or env.get("subtype") != "success":
         raise RuntimeError(env.get("result") or "claude error")
@@ -192,12 +192,15 @@ def _section(text: str, header: str) -> str:
 
 
 def _parse_stage1(text: str) -> Dict:
+    # Models sometimes emit the typographic apostrophe (U+2019) in this header.
+    macro_calendar = re.findall(r"(?m)^\s*[-*•]\s+(.+?)\s*$",
+                                _section(text, "Today's events")
+                                or _section(text, "Today’s events"))
     return {
         "exec_summary": _strip_control_lines(text, ("REGIME_BIAS", "SUMMARY_CONFIDENCE")),
         "headlines": re.findall(r"(?m)^\s*[-*•]\s+(.+?)\s*$",
                                 _section(text, "Headlines"))[:5],
-        "macro_calendar": re.findall(r"(?m)^\s*[-*•]\s+(.+?)\s*$",
-                                     _section(text, "Today's events")),
+        "macro_calendar": macro_calendar,
         "regime_bias": _control_line(text, "REGIME_BIAS", _REGIME_BIAS),
         "summary_confidence": _control_line(text, "SUMMARY_CONFIDENCE", _CONF),
     }
@@ -245,10 +248,10 @@ def _no_stage2(reason: str) -> Dict:
 
 def stage1_summarize(run_date: date, metrics: Dict, model: str | None = None) -> Dict:
     """Stage 1: news scrape + executive summary per prompts/01_news_exec_summary.md."""
-    prompt = _render_prompt("01_news_exec_summary.md",
-                            DATE=run_date.isoformat(),
-                            METRICS_JSON=json.dumps(metrics, indent=2, default=str))
-    try:
+    try:  # render, CLI call, and parse all degrade on ANY failure
+        prompt = _render_prompt("01_news_exec_summary.md",
+                                DATE=run_date.isoformat(),
+                                METRICS_JSON=json.dumps(metrics, indent=2, default=str))
         parsed = _parse_stage1(_call_claude(prompt, model))
         parsed["source"] = "claude-cli"
         return parsed
@@ -259,11 +262,11 @@ def stage1_summarize(run_date: date, metrics: Dict, model: str | None = None) ->
 def stage2_decide(run_date: date, stage1: Dict, options: Dict[str, Dict],
                   model: str | None = None) -> Dict:
     """Stage 2: committee ranking of the three options per prompts/02_options_analysis.md."""
-    prompt = _render_prompt("02_options_analysis.md",
-                            DATE=run_date.isoformat(),
-                            STAGE1_TEXT=stage1.get("exec_summary", "(unavailable)"),
-                            OPTIONS_JSON=json.dumps(options, indent=2, default=str))
-    try:
+    try:  # render, CLI call, and parse all degrade on ANY failure
+        prompt = _render_prompt("02_options_analysis.md",
+                                DATE=run_date.isoformat(),
+                                STAGE1_TEXT=stage1.get("exec_summary", "(unavailable)"),
+                                OPTIONS_JSON=json.dumps(options, indent=2, default=str))
         parsed = _parse_stage2(_call_claude(prompt, model))
         parsed["source"] = "claude-cli"
         return parsed
