@@ -357,3 +357,58 @@ def test_prompt_sop_headers_match_parsers():
     # Every token must be substituted at render time (stage2 also passes the
     # stage-1 self-report labels, which _parse_stage1 strips from exec_summary).
     assert not re.search(r"\{[A-Z0-9_]+\}", t1 + t2), "unsubstituted token in rendered prompt"
+
+
+def test_build_report_tex_hostile_input(tmp_path, monkeypatch):
+    # The entire render path must survive hostile web/LLM text: control chars,
+    # emoji, raw LaTeX specials, and a veto override on the execute line.
+    # _find_pdflatex and LOG_DIR are module globals read inside build_report --
+    # patch them where they are USED.
+    import live.discretionary as dd
+    from live.discretionary import build_report
+
+    monkeypatch.setattr(dd, "_find_pdflatex", lambda: None)
+    monkeypatch.setattr(dd, "LOG_DIR", tmp_path)
+
+    systematic = {"sleeve": {"A": 0.5, "BIL_ballast": 0.5},
+                  "tickers": {"SPY": 0.5, "BIL": 0.5}}
+    metrics = {
+        "vix_close": 16.7,
+        "turnover_oneway_pct": 12.5,
+        "top_tickers": ["BRK_B", "XOM"],     # list value, not a Python repr
+        "future_field": None,                # None -> "n/a"
+        "holdings_below_sma200": ["BRK_B"],
+    }
+    specials = "% $ # & _ { } ~ ^ \\"        # all 10 LaTeX specials
+    stage1 = {
+        "exec_summary": f"Hostile {specials} \x08 😀 café — end",
+        "regime_bias": "risk_on",
+        "summary_confidence": "high",
+    }
+    stage2 = {
+        "assessment": "Assess 100% & $ # _ { } ~ ^ \\ 😀 — ok",
+        "ranking": [{"rank": 1, "option": "risk_on", "reason": "50% upside & $gain"}],
+        "recommended_option": "risk_on",
+        "veto": "yes",
+        "confidence": "med",
+    }
+    options = {name: {"sleeve": {"A": 0.5, "BIL_ballast": 0.5},
+                      "tickers": {"SPY": 0.5, "BIL": 0.5},
+                      "note": f"50% capped & repaired ({name})"}
+               for name in ("systematic", "risk_on", "risk_off")}
+
+    out = build_report(date(2025, 6, 30), systematic, metrics, options,
+                       stage1, stage2, equity=100_000.0, out_pdf=tmp_path / "out.pdf")
+
+    assert out.suffix == ".tex" and out.exists()
+    tex = out.read_text(encoding="utf-8")
+    # Hostile characters never reach the .tex.
+    assert "\x08" not in tex and "😀" not in tex
+    # Whitelist keeps accents and em-dashes.
+    assert "café" in tex and "—" in tex
+    # LaTeX specials are escaped, and the structural underscore with them.
+    assert "BIL\\_ballast" in tex
+    assert "\\%" in tex and "\\&" in tex
+    # Veto forces the execute line to systematic, never the vetoed risk_on.
+    assert "--option systematic --date 2025-06-30" in tex
+    assert "--option risk_on" not in tex

@@ -302,11 +302,27 @@ _LATEX_SPECIAL = {
     "^": r"\textasciicircum{}",
 }
 
+# Stage-1 prose comes from web-scraped headlines, so hostile characters are an
+# everyday input: one un-whitelisted character (a U+0008 control char, an emoji,
+# ...) makes pdflatex abort with "! LaTeX Error: Unicode character ... not set
+# up for use with LaTeX" and the whole PDF is lost. So besides escaping the
+# LaTeX specials, _tex_escape strips control characters and DROPS anything
+# outside a conservative whitelist: printable ASCII + Latin-1 accents
+# (é ü ñ ...) + common typographic punctuation (em/en-dashes, curly quotes).
+_TEX_TYPOGRAPHIC = set("—–‘’“”…×†‡•")
+
 
 def _tex_escape(s: str) -> str:
     out = []
     for ch in str(s):
-        out.append(_LATEX_SPECIAL.get(ch, ch))
+        code = ord(ch)
+        if ch in ("\n", "\t"):
+            out.append(ch)                      # structural whitespace is kept
+        elif code < 0x20 or 0x7F <= code <= 0x9F:
+            continue                            # other C0/C1 control chars: dropped
+        elif code < 0x7F or 0xA0 <= code <= 0xFF or ch in _TEX_TYPOGRAPHIC:
+            out.append(_LATEX_SPECIAL.get(ch, ch))
+        # else: outside the whitelist (emoji, exotic symbols) -> dropped
     return "".join(out)
 
 
@@ -350,7 +366,15 @@ def _find_pdflatex() -> str | None:
 
 
 def _kv_table(d: Dict) -> str:
-    rows = [f"{_tex_escape(k)} & {_tex_escape(v)} \\\\" for k, v in d.items()]
+    rows = []
+    for k, v in d.items():
+        if v is None:
+            shown = "n/a"
+        elif isinstance(v, (list, tuple)):
+            shown = ", ".join(str(x) for x in v)
+        else:
+            shown = str(v)
+        rows.append(f"{_tex_escape(k)} & {_tex_escape(shown)} \\\\")
     return ("\\begin{tabular}{ll}\n\\hline\nMetric & Value \\\\\n\\hline\n"
             + "\n".join(rows) + "\n\\hline\n\\end{tabular}")
 
@@ -416,9 +440,11 @@ def build_report(
     ranking = "\n\n".join(
         f"{r['rank']}. \\textbf{{{_tex_escape(r['option'])}}} --- {_tex_escape(r['reason'])}"
         for r in stage2.get("ranking", []) if r.get("option"))
-    rec = stage2.get("recommended_option") or "none"
-    if stage2.get("veto") == "yes":
-        rec = "systematic (VETO)"
+    # Veto overrides the recommendation everywhere: the committee section shows
+    # "systematic (VETO)" and the execute line below must trade `systematic`.
+    vetoed = stage2.get("veto") == "yes"
+    trade_name = "systematic" if vetoed else (stage2.get("recommended_option") or "")
+    rec = f"{trade_name} (VETO)" if vetoed else (trade_name or "none")
     sections.append(
         "\\section*{Committee decision}\n"
         + _tex_escape(stage2.get("assessment") or "(unavailable)").replace("\n", "\n\n")
@@ -430,7 +456,7 @@ def build_report(
     sections.append(
         "\\section*{How to execute}\nPick one option and run:\\\\\n"
         f"\\texttt{{python scripts/rebalance.py --option "
-        f"{_tex_escape(stage2.get('recommended_option') or '<name>')} "
+        f"{_tex_escape(trade_name or '<name>')} "
         f"--date {run_date.isoformat()}}}")
 
     doc = (
@@ -448,16 +474,30 @@ def build_report(
 
     pdflatex = _find_pdflatex()
     if pdflatex:
-        subprocess.run(
-            [pdflatex, "-interaction=nonstopmode", "-halt-on-error",
-             f"-output-directory={build_dir}", str(tex_path)],
-            capture_output=True, text=True, timeout=120)
         built = build_dir / tex_path.with_suffix(".pdf").name
-        if built.exists():
-            out_pdf.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(built), str(out_pdf))
-            return out_pdf
-    print(f"WARN: pdflatex not found or failed; .tex left at {tex_path}")
+        try:  # a stale PDF from an earlier failed run must never be reused
+            built.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            # Never raise: a TimeoutExpired (MiKTeX on-the-fly package install)
+            # or a OneDrive sync lock on the move must degrade to the .tex path,
+            # never kill the 07:00 run.
+            proc = subprocess.run(
+                [pdflatex, "-interaction=nonstopmode", "-halt-on-error",
+                 f"-output-directory={build_dir}", str(tex_path)],
+                capture_output=True, text=True, timeout=120)
+            if proc.returncode == 0 and built.exists():
+                out_pdf.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(built), str(out_pdf))
+                return out_pdf
+            print(f"WARN: pdflatex build failed (exit {proc.returncode}); "
+                  f".tex left at {tex_path}")
+            return tex_path
+        except Exception as e:
+            print(f"WARN: pdflatex build failed ({e}); .tex left at {tex_path}")
+            return tex_path
+    print(f"WARN: pdflatex not found; .tex left at {tex_path}")
     return tex_path
 
 
