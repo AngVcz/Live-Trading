@@ -144,7 +144,6 @@ def test_tilt_options_vix_overlay_disables_risk_on():
 
 def test_tilt_edges_unfundable_and_caps():
     from live.discretionary import _tilt_risk_on, _tilt_risk_off, _enforce_caps, _clip_tickers
-    import pandas as pd
     # (a) unfundable risk-on -> identity + note
     s = pd.Series({"A": 0.3, "B": 0.3, "rates": 0.05, "BIL_ballast": 0.05, "cta": 0.30})
     out, note = _tilt_risk_on(s)
@@ -166,3 +165,27 @@ def test_tilt_edges_unfundable_and_caps():
     # (d) ticker clip spills to BIL
     clipped = _clip_tickers({"SPY": 0.60, "BIL": 0.40})
     assert abs(clipped["SPY"] - 0.35) < 1e-12 and abs(clipped["BIL"] - 0.65) < 1e-12
+
+
+def test_metrics_panel_smoke():
+    from live.core_signals import build_core_returns
+    from live.portfolio import SleeveConfig, build_live_weights, build_sleeve_returns, decompose_target_to_tickers
+    from live.morning_metrics import compute_metrics_panel
+    prices = _load_prices().rename(columns={"^VIX": "VIX"})
+    ret_a, ret_b, weights_a, weights_b = build_core_returns(prices, commission_bps=10.0)
+    sleeve = build_live_weights(ret_a, ret_b, build_sleeve_returns(prices), SleeveConfig())
+    tickers = decompose_target_to_tickers(sleeve, weights_a.iloc[-1], weights_b.iloc[-1], prices)
+    m = compute_metrics_panel(prices, tickers, weights_a.iloc[-1], weights_b.iloc[-1],
+                              equity=100_000.0, as_of=date(2025, 6, 30))
+    for key in ("as_of", "vix_close", "vix_change_1d", "vix_percentile_252d",
+                "vix_overlay_active", "tnx_10y_level", "tnx_change_5d",
+                "tlt_above_sma200", "ief_above_sma200", "breadth_pct_above_sma200",
+                "holdings_below_sma200", "equity", "peak_equity", "drawdown_pct",
+                "guardrail_margin_pct", "turnover_oneway_pct", "sleeve_weights",
+                "top_tickers", "macro_calendar"):
+        assert key in m, key
+    assert isinstance(m["vix_overlay_active"], bool)
+    if m["vix_percentile_252d"] != "n/a":
+        assert 0.0 <= m["vix_percentile_252d"] <= 1.0
+    assert isinstance(m["holdings_below_sma200"], list)
+    assert m["macro_calendar"] == []
