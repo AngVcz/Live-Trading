@@ -356,4 +356,4 @@ def test_prompt_sop_headers_match_parsers():
     assert "— one-line reason" in t2
     # Every token must be substituted at render time (stage2 also passes the
     # stage-1 self-report labels, which _parse_stage1 strips from exec_summary).
-    assert not re.search(r"\{[A-Z_]+\}", t1 + t2), "unsubstituted token in rendered prompt"
+    assert not re.search(r"\{[A-Z0-9_]+\}", t1 + t2), "unsubstituted token in rendered prompt"

@@ -1,12 +1,7 @@
-"""Discretionary 07:30 macro-news overlay for the A+B+Diversifier Sleeves strategy.
-
-The LLM never touches weights. It produces only market analysis + a recommended
-profile (prose + one label). The three sizing combinations are computed
-deterministically from fixed regime-gate sleeve mappings (``PROFILES``), so the
-strategy stays reproducible; the LLM is an advisory input the human overrides.
-
-See ``scripts/morning_report.py`` for the end-to-end report flow and
-``scripts/rebalance.py --profile`` for the pick-then-trade step.
+"""Two-stage discretionary 07:30 macro-news overlay for the A+B+Diversifier
+Sleeves strategy. The LLM never touches weights: Stage 1 emits an executive
+summary, Stage 2 a committee ranking; all sizings come from deterministic tilt
+rules. See prompts/01_news_exec_summary.md and prompts/02_options_analysis.md.
 """
 from __future__ import annotations
 
@@ -299,99 +294,6 @@ def apply_profile(name: str) -> pd.Series:
     return s
 
 
-def _parse_analysis(text: str) -> Dict:
-    """Extract recommended profile + confidence from the model's free-form text.
-
-    The prompt asks the model to end with two lines:
-        RECOMMENDED_PROFILE: <aggressive|balanced|passive>
-        CONFIDENCE: <low|med|high>
-    Headlines = leading bullet lines. Everything else is the prose analysis.
-    """
-    rec = ""
-    m = re.search(r"(?im)^\s*RECOMMENDED_PROFILE:\s*([a-zA-Z]+)\s*$", text)
-    if m:
-        rec = m.group(1).strip().lower()
-        if rec not in PROFILES:
-            rec = ""
-
-    conf = ""
-    m = re.search(r"(?im)^\s*CONFIDENCE:\s*([a-zA-Z]+)\s*$", text)
-    if m:
-        conf = m.group(1).strip().lower()
-
-    headlines = re.findall(r"(?m)^\s*(?:[-*•])\s+(.+?)\s*$", text)
-    # Strip the two trailing control lines from the prose body.
-    body = re.sub(r"(?im)^\s*RECOMMENDED_PROFILE:.*$\n?", "", text)
-    body = re.sub(r"(?im)^\s*CONFIDENCE:.*$\n?", "", body)
-    body = body.strip()
-
-    return {
-        "market_analysis": body,
-        "recommended_profile": rec,
-        "confidence": conf,
-        "rationale": "",  # prose body already carries the rationale
-        "headlines": headlines[:5],
-    }
-
-
-def analyze(run_date: date, model: str | None = None) -> Dict:
-    """Call the headless ``claude`` CLI for market analysis + a recommended profile.
-
-    Reuses the user's existing Claude Code auth (no extra key). On any failure the
-    report still ships deterministic tables with ``source == "none"``. Pass
-    ``model`` (e.g. ``"claude-fable-5"``) to override the CLI's default model.
-    """
-    prompt = (
-        "You are a macro/market analyst for a dual-momentum ETF portfolio with five "
-        "sleeves: equity-momentum engines A and B, a rates sleeve (TLT/IEF/BIL by "
-        "200-day trend), a BIL ballast sleeve (cash proxy; replaces the SH bear sleeve), "
-        "and a CTA proxy (PDBC/DBMF/KMLM in uptrend, else BIL).\n\n"
-        f"Today is {run_date.isoformat()}. Use web search to gather the latest "
-        "financial and macroeconomic news: central banks (Fed/ECB), inflation/CPI, "
-        "employment, GDP, geopolitics, equity-market moves, VIX, Treasury yields, "
-        "and commodities.\n\n"
-        "Write a concise market analysis (3-6 short paragraphs). Then recommend "
-        "exactly ONE of three fixed sizing profiles for today:\n"
-        "  - aggressive: risk-on tilt (more A/B equity momentum and CTA, less BIL ballast)\n"
-        "  - balanced:   neutral, 20% in each sleeve (the systematic baseline)\n"
-        "  - passive:    risk-off tilt (more rates/BIL ballast/defensive, less equity)\n\n"
-        "Optionally prefix your response with up to 5 one-line headline bullets "
-        "(each line starting with '- '). End your response with exactly two lines:\n"
-        "RECOMMENDED_PROFILE: <aggressive|balanced|passive>\n"
-        "CONFIDENCE: <low|med|high>\n"
-        "Do not add anything after those two lines."
-    )
-    try:
-        cmd = ["claude", "-p", prompt, "--output-format", "json", "--allowedTools", "WebSearch"]
-        if model:
-            cmd += ["--model", model]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
-        )
-        if proc.returncode != 0:
-            return _no_analysis(f"claude exit {proc.returncode}")
-        env = json.loads(proc.stdout)
-        if env.get("is_error") or env.get("subtype") != "success":
-            return _no_analysis(env.get("result") or "claude error")
-        parsed = _parse_analysis(env.get("result", ""))
-        parsed["source"] = "claude-cli"
-        return parsed
-    except Exception as e:  # ponytail: any failure -> deterministic-only report
-        return _no_analysis(str(e))
-
-
-def _no_analysis(reason: str) -> Dict:
-    return {
-        "market_analysis": f"(Market analysis unavailable: {reason}. Sizing tables below are still valid.)",
-        "recommended_profile": "",
-        "confidence": "",
-        "rationale": "",
-        "headlines": [],
-        "source": "none",
-    }
-
-
 # ---- LaTeX report ----------------------------------------------------------
 
 _LATEX_SPECIAL = {
@@ -418,7 +320,7 @@ def _dollars(w: float, equity: float) -> str:
 
 def _sleeve_table(sleeve: Dict[str, float], equity: float) -> str:
     rows = []
-    for k in _SLEEVE_ORDER:
+    for k in SLEEVE_ORDER:
         w = sleeve.get(k, 0.0)
         rows.append(f"{_tex_escape(k)} & {_pct(w)} & {_dollars(w, equity)} \\\\")
     return (
@@ -447,11 +349,30 @@ def _find_pdflatex() -> str | None:
     return str(candidate) if candidate.exists() else None
 
 
+def _kv_table(d: Dict) -> str:
+    rows = [f"{_tex_escape(k)} & {_tex_escape(v)} \\\\" for k, v in d.items()]
+    return ("\\begin{tabular}{ll}\n\\hline\nMetric & Value \\\\\n\\hline\n"
+            + "\n".join(rows) + "\n\\hline\n\\end{tabular}")
+
+
+def _ticker_delta_table(tickers: Dict[str, float], base: Dict[str, float],
+                        equity: float) -> str:
+    rows = []
+    for t, w in sorted(tickers.items(), key=lambda kv: kv[1], reverse=True):
+        d = 100.0 * (w - base.get(t, 0.0))
+        rows.append(f"{_tex_escape(t)} & {100*w:.1f} & {d:+.1f} & {_dollars(w, equity)} \\\\")
+    return ("\\begin{tabular}{lrrr}\n\\hline\n"
+            "Ticker & Weight (\\%) & $\\Delta$ pp & \\$ \\\\\n\\hline\n"
+            + "\n".join(rows) + "\n\\hline\n\\end{tabular}")
+
+
 def build_report(
     run_date: date,
     systematic: Dict,
-    profiles: Dict[str, Dict],
-    analysis: Dict,
+    metrics: Dict,
+    options: Dict[str, Dict],
+    stage1: Dict,
+    stage2: Dict,
     equity: float,
     out_pdf: Path,
 ) -> Path:
@@ -460,32 +381,57 @@ def build_report(
     build_dir = LOG_DIR / "_build"
     build_dir.mkdir(parents=True, exist_ok=True)
 
-    rec = analysis.get("recommended_profile", "")
-    conf = analysis.get("confidence", "")
-    body = analysis.get("market_analysis", "")
-
     sections = []
-    sections.append(f"\\section*{{Original systematic sizings}}\n"
-                    f"Account equity: \\${equity:,.0f}\n\n"
-                    f"\\subsection*{{Sleeve}}\n{_sleeve_table(systematic['sleeve'], equity)}\n\n"
-                    f"\\subsection*{{Tickers}}\n{_ticker_table(systematic['tickers'], equity)}")
+    sections.append(
+        "\\section*{Original systematic sizings}\n"
+        f"Account equity: \\${equity:,.0f}\n\n"
+        f"\\subsection*{{Sleeve}}\n{_sleeve_table(systematic['sleeve'], equity)}\n\n"
+        f"\\subsection*{{Tickers}}\n{_ticker_table(systematic['tickers'], equity)}")
 
-    sections.append("\\section*{Market analysis}\n" + _tex_escape(body).replace("\n", "\n\n"))
-    sections.append(f"\\section*{{Recommendation}}\n"
-                    f"Recommended profile: \\textbf{{{_tex_escape(rec or 'none')}}} "
-                    f"(confidence: {_tex_escape(conf or 'n/a')})")
+    panel = {k: metrics.get(k) for k in (
+        "vix_close", "vix_change_1d", "vix_percentile_252d", "vix_overlay_active",
+        "tnx_10y_level", "tnx_change_5d", "tlt_above_sma200", "ief_above_sma200",
+        "breadth_pct_above_sma200", "holdings_below_sma200", "equity",
+        "peak_equity", "drawdown_pct", "guardrail_margin_pct", "turnover_oneway_pct")}
+    sections.append("\\section*{Metrics panel}\n" + _kv_table(panel))
 
-    for name in PROFILES:
-        p = profiles[name]
-        star = " \\textbf{(recommended)}" if name == rec else ""
-        sections.append(f"\\section*{{Sizing combination: {name}{star}}}\n"
-                        f"\\subsection*{{Sleeve}}\n{_sleeve_table(p['sleeve'], equity)}\n\n"
-                        f"\\subsection*{{Tickers}}\n{_ticker_table(p['tickers'], equity)}")
+    s1 = (stage1.get("exec_summary") or "(unavailable)")
+    regime = stage1.get("regime_bias") or "n/a"
+    sections.append(
+        "\\section*{Executive summary}\n"
+        + _tex_escape(s1).replace("\n", "\n\n")
+        + f"\n\nRegime bias: \\textbf{{{_tex_escape(regime)}}} "
+          f"(confidence: {_tex_escape(stage1.get('summary_confidence') or 'n/a')})")
 
-    sections.append("\\section*{How to execute}\n"
-                    "Pick one profile and run:\\\\\n"
-                    f"\\texttt{{python scripts/rebalance.py --profile "
-                    f"{rec or '<name>'} --date {run_date.isoformat()}}}")
+    base = systematic["tickers"]
+    for name in OPTION_NAMES:
+        o = options[name]
+        note = f"\\\\\nNote: {_tex_escape(o['note'])}" if o.get("note") else ""
+        sections.append(
+            f"\\section*{{Option: {_tex_escape(name)}}}\n"
+            f"\\subsection*{{Sleeve}}\n{_sleeve_table(o['sleeve'], equity)}\n\n"
+            f"\\subsection*{{Tickers (delta vs systematic)}}\n"
+            f"{_ticker_delta_table(o['tickers'], base, equity)}{note}")
+
+    ranking = "\n\n".join(
+        f"{r['rank']}. \\textbf{{{_tex_escape(r['option'])}}} --- {_tex_escape(r['reason'])}"
+        for r in stage2.get("ranking", []) if r.get("option"))
+    rec = stage2.get("recommended_option") or "none"
+    if stage2.get("veto") == "yes":
+        rec = "systematic (VETO)"
+    sections.append(
+        "\\section*{Committee decision}\n"
+        + _tex_escape(stage2.get("assessment") or "(unavailable)").replace("\n", "\n\n")
+        + (f"\n\n{ranking}" if ranking else "")
+        + f"\n\nRecommended option: \\textbf{{{_tex_escape(rec)}}} "
+          f"(confidence: {_tex_escape(stage2.get('confidence') or 'n/a')}, "
+          f"veto: {_tex_escape(stage2.get('veto') or 'n/a')})")
+
+    sections.append(
+        "\\section*{How to execute}\nPick one option and run:\\\\\n"
+        f"\\texttt{{python scripts/rebalance.py --option "
+        f"{_tex_escape(stage2.get('recommended_option') or '<name>')} "
+        f"--date {run_date.isoformat()}}}")
 
     doc = (
         "\\documentclass[11pt]{article}\n"
@@ -505,14 +451,12 @@ def build_report(
         subprocess.run(
             [pdflatex, "-interaction=nonstopmode", "-halt-on-error",
              f"-output-directory={build_dir}", str(tex_path)],
-            capture_output=True, text=True, timeout=120,
-        )
+            capture_output=True, text=True, timeout=120)
         built = build_dir / tex_path.with_suffix(".pdf").name
         if built.exists():
             out_pdf.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(built), str(out_pdf))
             return out_pdf
-    # ponytail: no pdflatex -> leave the .tex so the user can compile by hand
     print(f"WARN: pdflatex not found or failed; .tex left at {tex_path}")
     return tex_path
 
@@ -520,30 +464,31 @@ def build_report(
 # ---- self-check ------------------------------------------------------------
 
 def _self_check() -> None:
-    # 1. profiles sum to 1.0 and apply_profile renormalizes.
-    for name, vec in PROFILES.items():
-        assert abs(sum(vec.values()) - 1.0) < 1e-9, f"{name} does not sum to 1.0"
-        s = apply_profile(name)
-        assert list(s.index) == _SLEEVE_ORDER, f"{name} wrong index"
-        assert abs(s.sum() - 1.0) < 1e-9, f"{name} not renormalized to 1.0"
-    # 2. parser extracts the control lines and leaves prose.
-    sample = (
-        "- Fed held rates, signaled patience.\n"
-        "- CPI cooled to 2.9%.\n\n"
-        "Equity momentum is intact but valuations are stretched. Yields fell, "
-        "supporting the rates sleeve. VIX is elevated.\n\n"
-        "RECOMMENDED_PROFILE: balanced\n"
-        "CONFIDENCE: med\n"
-    )
-    parsed = _parse_analysis(sample)
-    assert parsed["recommended_profile"] == "balanced", parsed
-    assert parsed["confidence"] == "med", parsed
-    assert "RECOMMENDED_PROFILE" not in parsed["market_analysis"]
-    assert len(parsed["headlines"]) == 2, parsed
-    # 3. unknown recommendation is rejected.
-    bad = _parse_analysis("analysis\nRECOMMENDED_PROFILE: moonshot\nCONFIDENCE: high\n")
-    assert bad["recommended_profile"] == "", bad
-    print("discretionary self-check OK: 3 profiles, parser, apply_profile")
+    # Tilt engine on a neutral toy sleeve (sums to 1, caps, ordering).
+    sleeve = pd.Series({"A": 0.20, "B": 0.20, "rates": 0.20,
+                        "BIL_ballast": 0.20, "cta": 0.20})
+    on, _ = _tilt_risk_on(sleeve)
+    off, _ = _tilt_risk_off(sleeve, rates_in_uptrend=True)
+    for v in (on, off):
+        assert abs(v.sum() - 1.0) < 1e-9
+    assert abs(on["A"] + on["B"] - 0.60) < 1e-9
+    assert abs(off["A"] + off["B"] - 0.20) < 1e-9
+    assert abs(off["rates"] - 0.45) < 1e-9  # cap binds; remainder spills to BIL_ballast
+    on2, note2 = _tilt_risk_on(pd.Series({"A": 0.3, "B": 0.3, "rates": 0.05,
+                                          "BIL_ballast": 0.05, "cta": 0.30}))
+    assert note2 == "risk-on tilt unfundable; systematic kept"
+    # Parsers accept valid control lines and reject bad enums.
+    s1 = _parse_stage1("## Today's events\n- 08:30 ET: CPI (BLS)\n\nx\n"
+                       "REGIME_BIAS: risk_off\nSUMMARY_CONFIDENCE: high\n")
+    assert s1["regime_bias"] == "risk_off" and s1["macro_calendar"] == ["08:30 ET: CPI (BLS)"]
+    s2 = _parse_stage2("## Option ranking\n1. risk_on — breadth strong.\n\n"
+                       "RECOMMENDED_OPTION: risk_on\nCONFIDENCE: med\nVETO: no\n")
+    assert s2["recommended_option"] == "risk_on" and s2["ranking"][0]["option"] == "risk_on"
+    assert _parse_stage2("RECOMMENDED_OPTION: yolo\nVETO: maybe\n")["veto"] == ""
+    # Prompt files render with all tokens substituted.
+    t = _render_prompt("01_news_exec_summary.md", DATE="2026-08-27", METRICS_JSON="{}")
+    assert "{DATE}" not in t and "{METRICS_JSON}" not in t
+    print("discretionary self-check OK: tilt engine, parsers, prompt tokens")
 
 
 if __name__ == "__main__":

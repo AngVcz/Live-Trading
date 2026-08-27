@@ -50,10 +50,10 @@ Plain numbered lines only — no table, no bold, one line per rank.
 
 Replace each <angle-bracket> placeholder with one of the listed values — do not include the brackets or any other formatting.
 
+Rank each option exactly once; RECOMMENDED_OPTION must be your rank-1 choice; if VETO is yes, rank and recommend systematic.
+
 End your response with exactly these three lines and nothing after them:
 
 RECOMMENDED_OPTION: <systematic|risk_on|risk_off>
 CONFIDENCE: <low|med|high>
 VETO: <yes|no>
-
-Rank each option exactly once; RECOMMENDED_OPTION must be your rank-1 choice; if VETO is yes, rank and recommend systematic.
