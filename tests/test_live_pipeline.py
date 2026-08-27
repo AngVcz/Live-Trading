@@ -6,6 +6,8 @@ outputs end-to-end.
 """
 from __future__ import annotations
 
+import json
+
 from datetime import date, timedelta
 
 import pandas as pd
@@ -412,3 +414,41 @@ def test_build_report_tex_hostile_input(tmp_path, monkeypatch):
     # Veto forces the execute line to systematic, never the vetoed risk_on.
     assert "--option systematic --date 2025-06-30" in tex
     assert "--option risk_on" not in tex
+
+
+def test_load_option_veto_override(tmp_path, monkeypatch, capsys):
+    # Money path: _load_option's veto backstop must swap a vetoed non-systematic
+    # option for the report's systematic option BEFORE any weights are loaded.
+    # LOG_DIR is a module global read inside _load_option -- patch where USED.
+    import scripts.rebalance as rb
+
+    payload = {
+        "options": {
+            "systematic": {"tickers": {"BIL": 1.0}, "sleeve": {"BIL_ballast": 1.0}},
+            "risk_off": {"tickers": {"SPY": 0.5, "BIL": 0.5},
+                         "sleeve": {"A": 0.5, "BIL_ballast": 0.5}},
+        },
+        "stage2": {"veto": "yes"},
+    }
+    path = tmp_path / "discretionary_2025-06-30.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(rb, "LOG_DIR", tmp_path)
+
+    # veto=yes + non-systematic requested -> the report's SYSTEMATIC is loaded.
+    tickers, sleeve = rb._load_option(date(2025, 6, 30), "risk_off")
+    assert tickers == {"BIL": 1.0}
+    assert sleeve.to_dict() == {"BIL_ballast": 1.0}
+    assert "VETO ACTIVE" in capsys.readouterr().out
+
+    # veto=no: the requested option is returned unchanged.
+    payload["stage2"]["veto"] = "no"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    tickers, sleeve = rb._load_option(date(2025, 6, 30), "risk_off")
+    assert tickers == {"SPY": 0.5, "BIL": 0.5}
+    assert sleeve.to_dict() == {"A": 0.5, "BIL_ballast": 0.5}
+    assert "VETO ACTIVE" not in capsys.readouterr().out
+
+    # Missing report -> a loud FileNotFoundError, never a silent empty book.
+    monkeypatch.setattr(rb, "LOG_DIR", tmp_path / "nope")
+    with pytest.raises(FileNotFoundError):
+        rb._load_option(date(2025, 6, 30), "risk_off")

@@ -68,19 +68,24 @@ def test_empty_sleeve_to_bil():
     assert abs(sum(out.values()) - 1.0) < 1e-9
 
 
-# (b2) discretionary profile form: apply_profile returns a Series with BIL_ballast
-# and NO 'bear' key. decompose must not KeyError on .loc['bear'] and must route the
-# BIL_ballast budget to BIL. Regression: the bear->BIL_ballast reconciliation renamed
-# PROFILES but decompose still hardcoded .loc['bear'], so morning_report.py crashed
-# building the first profile table (uncaught: self-check + pytest never decompose).
-def test_decompose_accepts_profile_form_bil_ballast_no_bear_key():
-    from live.discretionary import apply_profile
+# (b2) discretionary option form: the sleeve Series built by the tilt engine
+# (live.discretionary.build_tilt_options) carries a BIL_ballast key and NO 'bear'
+# key. decompose must not KeyError on .loc['bear'] and must route the BIL_ballast
+# budget to BIL. Regression: the bear->BIL_ballast reconciliation renamed the sleeve
+# keys but decompose still hardcoded .loc['bear'], so morning_report.py crashed
+# building the first option table (uncaught: self-check + pytest never decompose).
+# (Built here as a literal, mirroring apply_profile("balanced") — the fixed
+# PROFILES vectors were deleted in Task 6 and superseded by the tilt engine.)
+def test_decompose_accepts_option_form_bil_ballast_no_bear_key():
     from live.portfolio import decompose_target_to_tickers
 
     prices = _flat_panel(260, SLEEVE_TICKERS)
     weight_a = pd.Series(dtype=float)
     weight_b = pd.Series(dtype=float)
-    sleeve = apply_profile("balanced")  # index A,B,rates,BIL_ballast,cta — NO bear
+    sleeve = pd.Series(  # index A,B,rates,BIL_ballast,cta — NO bear
+        {"A": 0.20, "B": 0.20, "rates": 0.20, "BIL_ballast": 0.20, "cta": 0.20},
+        dtype=float,
+    )
 
     out = decompose_target_to_tickers(sleeve, weight_a, weight_b, prices)
 

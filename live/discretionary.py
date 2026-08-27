@@ -20,7 +20,6 @@ LOG_DIR = REPO_ROOT / "logs"
 
 PROMPTS_DIR = REPO_ROOT / "prompts"
 SLEEVE_ORDER = ["A", "B", "rates", "BIL_ballast", "cta"]
-_SLEEVE_ORDER = SLEEVE_ORDER  # alias; removed in Task 6 with apply_profile
 OPTION_NAMES = ("systematic", "risk_on", "risk_off")
 _RISK_SLEEVES = ("A", "B", "rates", "cta")   # BIL_ballast is the cash sink, uncapped
 SLEEVE_CAP = 0.45
@@ -274,24 +273,7 @@ def stage2_decide(run_date: date, stage1: Dict, options: Dict[str, Dict],
         return _no_stage2(str(e))
 
 
-# Fixed regime-gate sleeve allocations. Each sums to 1.0. The LLM picks one; it
-# never edits these numbers.
-PROFILES: Dict[str, Dict[str, float]] = {
-    "aggressive": {"A": 0.30, "B": 0.25, "rates": 0.10, "BIL_ballast": 0.05, "cta": 0.30},
-    "balanced": {"A": 0.20, "B": 0.20, "rates": 0.20, "BIL_ballast": 0.20, "cta": 0.20},
-    "passive": {"A": 0.10, "B": 0.10, "rates": 0.30, "BIL_ballast": 0.25, "cta": 0.25},
-}
-
 _MIKTEX_BIN = Path(r"C:\Users\angve\AppData\Local\Programs\MiKTeX\miktex\bin\x64")
-
-
-def apply_profile(name: str) -> pd.Series:
-    """Return the sleeve-level weight Series for a profile, renormalized to 1.0."""
-    if name not in PROFILES:
-        raise ValueError(f"unknown profile '{name}'; choose one of {list(PROFILES)}")
-    s = pd.Series(PROFILES[name], index=_SLEEVE_ORDER, dtype=float)
-    s = s / s.sum()
-    return s
 
 
 # ---- LaTeX report ----------------------------------------------------------

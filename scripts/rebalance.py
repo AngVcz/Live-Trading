@@ -10,10 +10,9 @@ at 16:35 ET). It:
   5. Sends orders to Alpaca (paper by default).
   6. Logs weights, orders, and account state.
 
-With ``--profile {aggressive,balanced,passive}`` it instead trades the discretionary
-profile chosen from the 07:30 morning report
-(``logs/discretionary_<date>.json``); weights come from the report, not from the
-systematic engine.
+With ``--option {systematic,risk_on,risk_off}`` it instead trades the discretionary
+option chosen from the 07:30 morning report (``logs/discretionary_<date>.json``);
+weights come from the report, not from the systematic engine.
 
 Environment variables:
   ALPACA_API_KEY      required
@@ -23,7 +22,7 @@ Environment variables:
 Usage:
   cd Live
   python scripts/rebalance.py [--date YYYY-MM-DD] [--dry-run] [--prefer-yfinance]
-  python scripts/rebalance.py --profile balanced [--date YYYY-MM-DD]
+  python scripts/rebalance.py --option risk_off [--date YYYY-MM-DD]
 """
 from __future__ import annotations
 
@@ -60,7 +59,7 @@ if not os.environ.get("ALPACA_API_KEY") or not os.environ.get("ALPACA_API_SECRET
 
 from live.core_signals import UNIVERSE as CORE_UNIVERSE, build_core_returns
 from live.data_feed import fetch_panel, get_last_trading_day
-from live.discretionary import PROFILES, apply_profile
+from live.discretionary import OPTION_NAMES
 from live.portfolio import (
     SLEEVE_TICKERS,
     SleeveConfig,
@@ -92,11 +91,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--date", type=str, default=None, help="Run as-of date (YYYY-MM-DD)")
     p.add_argument("--dry-run", action="store_true", help="Do not place live orders")
     p.add_argument("--prefer-yfinance", action="store_true", help="Use yfinance instead of Alpaca")
-    p.add_argument("--profile", choices=list(PROFILES), default=None,
-                   help="Trade a discretionary profile from logs/discretionary_<date>.json")
+    p.add_argument("--option", choices=list(OPTION_NAMES), default=None,
+                   help="Trade a discretionary option from logs/discretionary_<date>.json")
     p.add_argument("--weights", type=str, default=None,
                    help="Custom ticker->weight JSON override (e.g. '{\"BIL\":0.5867,...}'); "
-                        "bypasses both the systematic engine and --profile. Risk guardrails still apply.")
+                        "bypasses both the systematic engine and --option. Risk guardrails still apply.")
     p.add_argument("--drift-threshold", type=float, default=DEFAULT_DRIFT_THRESHOLD,
                    help="Ticker-level drift threshold above which a rebalance is forced (default 0.05)")
     return p.parse_args()
@@ -172,8 +171,8 @@ def _save_run_log(
         f.write(json.dumps(record) + "\n")
 
 
-def _load_profile_tickers(run_date: date, profile: str) -> Dict[str, float]:
-    """Read the chosen profile's ticker weights from the morning report JSON."""
+def _load_option(run_date: date, option: str) -> Tuple[Dict[str, float], pd.Series]:
+    """Read the chosen option's ticker + sleeve weights from the morning report JSON."""
     path = LOG_DIR / f"discretionary_{run_date.isoformat()}.json"
     if not path.exists():
         raise FileNotFoundError(
@@ -182,7 +181,11 @@ def _load_profile_tickers(run_date: date, profile: str) -> Dict[str, float]:
         )
     with path.open(encoding="utf-8") as f:
         data = json.load(f)
-    return data["profiles"][profile]["tickers"]
+    if data.get("stage2", {}).get("veto") == "yes" and option != "systematic":
+        print(f"VETO ACTIVE in report: overriding --option {option} -> systematic")
+        option = "systematic"
+    o = data["options"][option]
+    return o["tickers"], pd.Series(o["sleeve"], dtype=float)
 
 
 # --- Drift gate (ticker-level) ----------------------------------------------
@@ -261,7 +264,7 @@ def decide_and_execute(
     else:
         target_dollars = {t: w * equity for t, w in target_tickers.items()}
         # ponytail: price the UNION of target + current book so off-target holdings
-        # (a --weights/--profile target that is a subset of the held book) can be sold.
+        # (a --weights/--option target that is a subset of the held book) can be sold.
         price_tickers = set(target_tickers) | set(current_positions)
         latest_prices = {t: float(prices[t].iloc[-1]) for t in price_tickers if t in prices.columns}
         # ponytail #3/#9: a missing TARGET price -> a rejected order; a missing HELD
@@ -308,14 +311,14 @@ def main() -> int:
     prefer_alpaca = not args.prefer_yfinance
 
     print(f"[{datetime.now()}] Live runner starting for {run_date} "
-          f"(dry_run={args.dry_run}, profile={args.profile})")
+          f"(dry_run={args.dry_run}, option={args.option})")
 
     # Fail fast on weekends/holidays BEFORE the expensive data-fetch/signal pipeline.
     if not RiskGuard().should_run_today(run_date):
         print("INFO: market closed today; skipping.")
         return 0
 
-    # 1-4. Systematic targets (also gives us prices for the profile path).
+    # 1-4. Systematic targets (also gives us prices for the option path).
     try:
         sys_targets = compute_systematic_targets(run_date, prefer_alpaca=prefer_alpaca)
     except Exception as e:
@@ -334,14 +337,13 @@ def main() -> int:
         # so a discretionary override is responsible for its own sleeve budget.
         sleeve_weights = pd.Series(dtype=float)
         print(f"Using custom --weights override ({len(target_tickers)} tickers).")
-    elif args.profile:
+    elif args.option:
         try:
-            target_tickers = _load_profile_tickers(run_date, args.profile)
+            target_tickers, sleeve_weights = _load_option(run_date, args.option)
         except Exception as e:
-            print(f"FATAL: could not load profile '{args.profile}': {e}")
+            print(f"FATAL: could not load option '{args.option}': {e}")
             return 1
-        sleeve_weights = apply_profile(args.profile)
-        print(f"Using discretionary profile '{args.profile}' "
+        print(f"Using discretionary option '{args.option}' "
               f"({len(target_tickers)} tickers).")
     else:
         target_tickers = sys_targets["ticker_weights"]
