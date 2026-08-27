@@ -175,8 +175,7 @@ def test_metrics_panel_smoke():
     ret_a, ret_b, weights_a, weights_b = build_core_returns(prices, commission_bps=10.0)
     sleeve = build_live_weights(ret_a, ret_b, build_sleeve_returns(prices), SleeveConfig())
     tickers = decompose_target_to_tickers(sleeve, weights_a.iloc[-1], weights_b.iloc[-1], prices)
-    m = compute_metrics_panel(prices, tickers, weights_a.iloc[-1], weights_b.iloc[-1],
-                              equity=100_000.0, as_of=date(2025, 6, 30))
+    m = compute_metrics_panel(prices, tickers, equity=100_000.0, as_of=date(2025, 6, 30))
     for key in ("as_of", "vix_close", "vix_change_1d", "vix_percentile_252d",
                 "vix_overlay_active", "tnx_10y_level", "tnx_change_5d",
                 "tlt_above_sma200", "ief_above_sma200", "breadth_pct_above_sma200",
@@ -189,3 +188,40 @@ def test_metrics_panel_smoke():
         assert 0.0 <= m["vix_percentile_252d"] <= 1.0
     assert isinstance(m["holdings_below_sma200"], list)
     assert m["macro_calendar"] == []
+
+
+def test_metrics_panel_degrades_to_na(monkeypatch):
+    import live.data_feed as data_feed
+    import live.morning_metrics as mm
+    # Patch where they are USED (the morning_metrics namespace), not where defined.
+    monkeypatch.setattr(mm, "get_peak_equity", lambda: None)
+    monkeypatch.setattr(mm, "load_last_weights", lambda: None)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated TNX fetch failure")
+
+    monkeypatch.setattr(data_feed, "fetch_panel", _boom)
+
+    n = 50  # short history: every SMA200/percentile block must degrade to "n/a"
+    idx = pd.date_range(end=date(2025, 6, 30), periods=n, freq="B")
+    base = pd.Series([float(i) + 1.0 for i in range(n)], index=idx)
+    prices = pd.DataFrame({
+        "VIX": base * 0.2 + 15.0,
+        "TLT": base + 90.0,
+        "IEF": base + 95.0,
+        "SPY": base * 5.0 + 400.0,
+        "QQQ": base * 4.0 + 300.0,
+    })
+    m = mm.compute_metrics_panel(prices, {"XXX": 0.6, "BIL": 0.4},
+                                 equity=100_000.0, as_of=date(2025, 6, 30))
+    for key in ("vix_close", "vix_change_1d", "vix_percentile_252d",
+                "tnx_10y_level", "tnx_change_5d", "tlt_above_sma200",
+                "ief_above_sma200", "breadth_pct_above_sma200",
+                "turnover_oneway_pct"):
+        assert m[key] == "n/a", key
+    assert m["vix_overlay_active"] == "n/a"  # unknown VIX must NOT assert "no overlay"
+    assert m["holdings_below_sma200"] == []
+    # With nothing persisted, the equity fallback IS the honest book value.
+    assert m["peak_equity"] == 100_000.0
+    assert m["drawdown_pct"] == 0.0
+    assert m["guardrail_margin_pct"] == 10.0

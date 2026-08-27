@@ -7,16 +7,19 @@ never raises.
 """
 from __future__ import annotations
 
+import logging
 from datetime import date, timedelta
 from typing import Any, Dict
 
 import pandas as pd
 from scipy import stats
 
-from live.core_signals import UNIVERSE as CORE_UNIVERSE
+from live.core_signals import UNIVERSE as CORE_UNIVERSE, VIX_OVERLAY_PCTILE
 from live.state import get_peak_equity, load_last_weights
 
 _NA = "n/a"
+
+logger = logging.getLogger(__name__)
 
 
 def _last_two(col: pd.Series):
@@ -40,9 +43,9 @@ def _vix_metrics(prices: pd.DataFrame) -> Dict[str, Any]:
     window = col.dropna().tail(252)
     if len(window) < 126:
         raise ValueError("short VIX history")
-    pct = float(stats.percentileofscore(window, last, kind="rank") / 100.0)
+    pct = float(stats.percentileofscore(window, last, kind="mean") / 100.0)
     out["vix_percentile_252d"] = round(pct, 3)
-    out["vix_overlay_active"] = pct > 0.70   # VIX_OVERLAY_PCTILE in core_signals
+    out["vix_overlay_active"] = pct > VIX_OVERLAY_PCTILE   # same threshold as the strategy overlay path
     return out
 
 
@@ -71,8 +74,8 @@ def _breadth(prices: pd.DataFrame) -> Dict[str, Any]:
             "breadth_universe_n": len(cols)}
 
 
-def _holdings_below(prices: pd.DataFrame, weights_a: pd.Series, weights_b: pd.Series):
-    held = sorted(set(weights_a[weights_a > 0].index) | set(weights_b[weights_b > 0].index))
+def _holdings_below(prices: pd.DataFrame, ticker_weights: Dict[str, float]):
+    held = sorted(t for t, w in ticker_weights.items() if w > 0)
     below = []
     for t in held:
         if t in prices.columns:
@@ -85,7 +88,7 @@ def _holdings_below(prices: pd.DataFrame, weights_a: pd.Series, weights_b: pd.Se
 
 
 def _book_metrics(equity: float) -> Dict[str, Any]:
-    peak = get_peak_equity() or equity
+    peak = max(get_peak_equity() or equity, equity)  # never let a stale peak exceed the book
     dd = (equity - peak) / peak if peak > 0 else 0.0
     return {"peak_equity": round(float(peak), 2),
             "drawdown_pct": round(100.0 * dd, 2),
@@ -106,8 +109,6 @@ def _turnover(ticker_weights: Dict[str, float]):
 def compute_metrics_panel(
     prices: pd.DataFrame,
     ticker_weights: Dict[str, float],
-    weights_a: pd.Series,
-    weights_b: pd.Series,
     equity: float,
     as_of: date,
 ) -> Dict[str, Any]:
@@ -119,18 +120,18 @@ def compute_metrics_panel(
         lambda: {"tlt_above_sma200": _above_sma200(prices["TLT"])},
         lambda: {"ief_above_sma200": _above_sma200(prices["IEF"])},
         lambda: _breadth(prices),
-        lambda: {"holdings_below_sma200": _holdings_below(prices, weights_a, weights_b)},
+        lambda: {"holdings_below_sma200": _holdings_below(prices, ticker_weights)},
         lambda: _book_metrics(equity),
         lambda: {"turnover_oneway_pct": _turnover(ticker_weights)},
     ):
         try:
             m.update(block())
-        except Exception:
-            pass  # a failed block leaves its keys at the setdefault 'n/a' below
+        except Exception as e:
+            logger.warning("metrics block failed: %s", e)  # keys fall back to 'n/a' below
     m.setdefault("vix_close", _NA)
     m.setdefault("vix_change_1d", _NA)
     m.setdefault("vix_percentile_252d", _NA)
-    m.setdefault("vix_overlay_active", False)
+    m.setdefault("vix_overlay_active", _NA)
     m.setdefault("tnx_10y_level", _NA)
     m.setdefault("tnx_change_5d", _NA)
     m.setdefault("tlt_above_sma200", _NA)
@@ -162,8 +163,7 @@ def _self_check() -> None:
     ret_a, ret_b, wa, wb = build_core_returns(prices, commission_bps=10.0)
     sleeve = build_live_weights(ret_a, ret_b, build_sleeve_returns(prices), SleeveConfig())
     tw = decompose_target_to_tickers(sleeve, wa.iloc[-1], wb.iloc[-1], prices)
-    m = compute_metrics_panel(prices, tw, wa.iloc[-1], wb.iloc[-1],
-                              equity=100_000.0, as_of=end)
+    m = compute_metrics_panel(prices, tw, equity=100_000.0, as_of=end)
     assert isinstance(m["vix_overlay_active"], bool)
     if m["vix_percentile_252d"] != _NA:
         assert 0.0 <= m["vix_percentile_252d"] <= 1.0
