@@ -302,9 +302,10 @@ def _tnx_metrics(as_of: date) -> Dict[str, Any]:
     if len(col) < 6:
         raise ValueError("short TNX history")
     return {
-        # ^TNX quotes the 10Y yield x 10 (CBOE convention).
-        "tnx_10y_level": round(float(col.iloc[-1]) / 10.0, 3),
-        "tnx_change_5d": round(float(col.iloc[-1] - col.iloc[-6]) / 10.0, 3),
+        # yfinance's ^TNX series quotes the 10Y yield directly (verified vs
+        # FRED DGS10 2026-08-26: ^TNX close 4.67 == DGS10 4.66); no scaling.
+        "tnx_10y_level": round(float(col.iloc[-1]), 3),
+        "tnx_change_5d": round(float(col.iloc[-1] - col.iloc[-6]), 3),
     }
 
 
@@ -783,6 +784,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from datetime import date, datetime
@@ -814,6 +816,8 @@ from scripts.rebalance import compute_systematic_targets
 
 LOG_DIR = REPO_ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -862,7 +866,7 @@ def main() -> int:
     }
 
     metrics = compute_metrics_panel(
-        prices, sys_targets["ticker_weights"], latest_a, latest_b,
+        prices, sys_targets["ticker_weights"],
         equity=equity, as_of=run_date)
     metrics["sleeve_weights"] = systematic["sleeve"]
 
