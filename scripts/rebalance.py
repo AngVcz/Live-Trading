@@ -30,6 +30,7 @@ import argparse
 import json
 import math
 import os
+import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -320,6 +321,30 @@ def decide_and_execute(
     return orders, skipped, had_error
 
 
+def _publish_and_stamp() -> None:
+    """After real fills hit Alpaca, publish the portfolio log + Bitcoin timestamp.
+
+    stamp_log.py (personal-page repo) pulls the day's fills + position snapshot,
+    writes the sanitized (no-$) CSV, OTS-stamps it and uploads it to S3 so the
+    public portfolio page stays in sync with every rebalance. --force is safe
+    here: this only runs when THIS run just placed orders, so any stamp from
+    earlier today is stale (missing these fills) by definition. Stamping is
+    advisory -- never fails the rebalance; the trades already happened.
+    """
+    script = os.environ.get(
+        "STAMP_LOG_SCRIPT", r"C:\Users\angve\personal-page\stamp_log.py")
+    try:
+        r = subprocess.run([sys.executable, script, "--force"],
+                           capture_output=True, text=True, timeout=300)
+        lines = [ln for ln in (r.stdout or "").strip().splitlines() if ln.strip()]
+        print("STAMP: " + (lines[-1] if lines else f"exit={r.returncode}"))
+        if r.returncode != 0:
+            print((r.stderr or r.stdout or "").strip()[-400:])
+            print(f"STAMP: run manually if needed: python {script}")
+    except Exception as e:
+        print(f"STAMP: failed ({e}) -- run manually: python {script}")
+
+
 def main() -> int:
     args = _parse_args()
     run_date = date.fromisoformat(args.date) if args.date else get_last_trading_day()
@@ -448,6 +473,7 @@ def main() -> int:
         return 1
     if not skipped:
         print(f"[{datetime.now()}] Live runner finished successfully")
+        _publish_and_stamp()
     return 0
 
 
